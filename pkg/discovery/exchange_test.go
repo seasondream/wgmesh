@@ -3,6 +3,7 @@ package discovery
 import (
 	"encoding/json"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -577,5 +578,126 @@ func TestHandleGoodbye_BoundaryConditions(t *testing.T) {
 					tt.age, shouldReject, tt.shouldAccept)
 			}
 		})
+	}
+}
+
+// TestExchangeWithPeer_LogsWarningForOwnIP verifies that ExchangeWithPeer
+// logs a warning (but does NOT hard-refuse) when the target IP matches the
+// node's own public IP. This allows same-NAT/CGNAT peers to still connect.
+func TestExchangeWithPeer_LogsWarningForOwnIP(t *testing.T) {
+	cfg, err := daemon.NewConfig(daemon.DaemonOpts{Secret: "wgmesh-test-self-punch-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerStore := daemon.NewPeerStore()
+
+	localNode := &daemon.LocalNode{
+		WGPubKey: "local-pubkey",
+		MeshIP:   "10.0.0.1",
+	}
+	localNode.SetEndpoint("198.51.100.1:51820")
+
+	pe := NewPeerExchange(cfg, localNode, peerStore)
+
+	// Use a closed UDP conn so WriteToUDP fails fast (no 4s timeout)
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close() // close immediately — write will fail fast
+	pe.conn = conn
+
+	// Punch to own public IP — should NOT be hard-refused (soft warning only).
+	// Will fail with send error on the closed conn, which is expected.
+	_, err = pe.ExchangeWithPeer("198.51.100.1:52790")
+	if err != nil && strings.Contains(err.Error(), "refusing to punch") {
+		t.Errorf("ExchangeWithPeer should not hard-refuse own IP (same-NAT peers share IP): %v", err)
+	}
+}
+
+// TestExchangeWithPeer_AllowsDifferentIP verifies that ExchangeWithPeer
+// does NOT warn or block punching to a different IP (regression guard).
+func TestExchangeWithPeer_AllowsDifferentIP(t *testing.T) {
+	cfg, err := daemon.NewConfig(daemon.DaemonOpts{Secret: "wgmesh-test-self-punch-2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerStore := daemon.NewPeerStore()
+
+	localNode := &daemon.LocalNode{
+		WGPubKey: "local-pubkey",
+		MeshIP:   "10.0.0.1",
+	}
+	localNode.SetEndpoint("198.51.100.1:51820")
+
+	pe := NewPeerExchange(cfg, localNode, peerStore)
+
+	// Use a closed UDP conn so WriteToUDP fails fast (no 4s timeout)
+	conn, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	conn.Close() // close immediately — write will fail fast
+	pe.conn = conn
+
+	// Punching to a different IP should work without any self-connection concern.
+	_, err = pe.ExchangeWithPeer("203.0.113.42:51820")
+	if err != nil && strings.Contains(err.Error(), "refusing to punch") {
+		t.Errorf("should not refuse punch to different IP: %v", err)
+	}
+}
+
+// TestGetKnownPeers_ExcludesSelfAndEmpty verifies that getKnownPeers filters
+// out both the local node and empty-pubkey entries from the advertised peer list.
+func TestGetKnownPeers_ExcludesSelfAndEmpty(t *testing.T) {
+	cfg, err := daemon.NewConfig(daemon.DaemonOpts{Secret: "wgmesh-test-known-peers-self-1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerStore := daemon.NewPeerStore()
+
+	localNode := &daemon.LocalNode{
+		WGPubKey: "local-pubkey-abc",
+		MeshIP:   "10.0.0.1",
+	}
+
+	// Add local node, an empty-key entry, and a remote peer to the peer store
+	peerStore.Update(&daemon.PeerInfo{
+		WGPubKey: "local-pubkey-abc",
+		MeshIP:   "10.0.0.1",
+		Endpoint: "198.51.100.1:51820",
+	}, "dht")
+	peerStore.Update(&daemon.PeerInfo{
+		WGPubKey: "",
+		MeshIP:   "10.0.0.99",
+		Endpoint: "198.51.100.1:51820",
+	}, "dht")
+	peerStore.Update(&daemon.PeerInfo{
+		WGPubKey: "remote-pubkey-xyz",
+		MeshIP:   "10.0.0.2",
+		Endpoint: "203.0.113.42:51820",
+	}, "dht")
+
+	pe := NewPeerExchange(cfg, localNode, peerStore)
+	known := pe.getKnownPeers()
+
+	for _, kp := range known {
+		if kp.WGPubKey == "local-pubkey-abc" {
+			t.Error("getKnownPeers() should not include self (local-pubkey-abc)")
+		}
+		if kp.WGPubKey == "" {
+			t.Error("getKnownPeers() should not include empty-pubkey entries")
+		}
+	}
+
+	// Should still include the remote peer
+	found := false
+	for _, kp := range known {
+		if kp.WGPubKey == "remote-pubkey-xyz" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("getKnownPeers() should include remote peer (remote-pubkey-xyz)")
 	}
 }
