@@ -177,6 +177,15 @@ Mesh sync starts only if `-mesh-ip` is provided.
 - Edge nodes — pull xDS config or Caddyfile; POST health reports.
 - WireGuard mesh — sync messages travel as UDP over mesh tunnels; Sync binds to mesh IP.
 
+## Extraction
+
+> **Decision:** [[decision - 2603151026 - decouple lighthouse from wgmesh into separate repo]]
+>
+> Lighthouse is being extracted to its own repository.
+> `cmd/lighthouse/` and `pkg/lighthouse/` (server code) will move to the lighthouse repo.
+> `pkg/lighthouse/client.go` becomes the seed of a published `lighthouse-go` client SDK.
+> This spec will move to the lighthouse repo once extraction is complete.
+
 ## Mapping
 
 > [[pkg/lighthouse/types.go]]

@@ -17,7 +17,7 @@ and wires together the daemon, discovery, and RPC layers.
 
 1. **Version flags** (`--version`, `-v`) — checked before any flag parsing; prints `wgmesh <version>` and exits.
 2. **Subcommand routing** — if `os.Args[1]` matches a known subcommand name, dispatch and return:
-   `version`, `join`, `init`, `status`, `test-peer`, `qr`, `install-service`, `uninstall-service`, `rotate-secret`, `mesh`, `peers`.
+   `version`, `join`, `init`, `status`, `test-peer`, `qr`, `install-service`, `uninstall-service`, `rotate-secret`, `mesh`, `peers`, `service`.
 3. **Centralized flag mode** — falls through to `flag.Parse()` if no subcommand matched.
 
 ### Decentralized subcommands
@@ -109,9 +109,10 @@ Callbacks wired:
 
 - `pkg/daemon` — `NewConfig`, `NewDaemon`, `RunWithDHTDiscovery`, `GenerateSecret`, `FormatSecretURI`, `ConfigureLogging`, `ServiceStatus`, `InstallSystemdService`, `UninstallSystemdService`, `SystemdServiceConfig`, `GetRPC*` methods.
 - `pkg/rpc` — `NewServer`, `NewClient`, `GetSocketPath`, `ServerConfig`, `PeerData`, `StatusData`.
-- `pkg/mesh` — `Initialize`, `Load`, centralized mesh operations.
+- `pkg/mesh` — `Initialize`, `Load`, centralized mesh operations; `LoadAccount`/`SaveAccount` for Lighthouse credential storage.
 - `pkg/crypto` — `DeriveKeys`, `GenerateRotationAnnouncement`, `ReadPassword`, `SealEnvelope`, `OpenEnvelope`, `CreateAnnouncement`.
 - `pkg/discovery` — blank import triggers DHT factory registration.
+- `lighthouse-go` SDK (external) — `service` subcommand uses this to talk to the Lighthouse API. See [[decision - 2603151026 - decouple lighthouse from wgmesh into separate repo]].
 
 ## Mapping
 
