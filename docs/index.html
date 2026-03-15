@@ -212,7 +212,10 @@ footer { text-align: center; color: var(--muted); font-size: 0.75rem; padding: 2
 <body>
 
 <div class="header">
-  <h1>wgmesh Agent Pipeline</h1>
+  <h1 id="dashboard-title">wgmesh Agent Pipeline</h1>
+  <select id="repo-selector" style="font-size:0.8125rem;padding:0.25rem 0.5rem;border:1px solid var(--border);border-radius:4px;background:var(--bg);color:var(--fg);display:none" title="Switch repo">
+    <option value="">All repos</option>
+  </select>
   <span class="subtitle">Autonomous AI coding pipeline — issue to merge</span>
   <div style="margin-left:auto;text-align:right">
     <span class="refresh-info">Auto-refreshes every 5m &middot; <span id="last-update">loading...</span></span>
@@ -345,8 +348,7 @@ footer { text-align: center; color: var(--muted); font-size: 0.75rem; padding: 2
         <li>Binding vote on roadmap priorities</li>
         <li>Early access to all releases</li>
       </ul>
-      <!-- TODO: swap href for Polar.sh checkout link once account is set up (EU-based, lower friction) -->
-      <a class="tier-cta" href="https://github.com/sponsors/atvirokodosprendimai" target="_blank" rel="noopener">Become a founding member →</a>
+      <a class="tier-cta" href="https://polar.sh/checkout?productId=3f5d75de-936b-49d8-a21b-4b79d9fd22c1" target="_blank" rel="noopener noreferrer">Become a founding member →</a>
       <p class="founding-count">0 founding members so far — be first</p>
     </div>
     <div class="tier featured">
@@ -358,8 +360,7 @@ footer { text-align: center; color: var(--muted); font-size: 0.75rem; padding: 2
         <li>Private Discord/Matrix channel</li>
         <li>Logo on project README</li>
       </ul>
-      <!-- TODO: swap href for Polar.sh checkout link once account is set up -->
-      <a class="tier-cta" href="https://github.com/sponsors/atvirokodosprendimai" target="_blank" rel="noopener">Reserve your edge node →</a>
+      <a class="tier-cta" href="https://polar.sh/checkout?productId=1927e637-4cfd-4c94-8bee-c5518803bc89" target="_blank" rel="noopener noreferrer">Reserve your edge node →</a>
     </div>
     <div class="tier">
       <h3>Mesh Operator</h3>
@@ -371,13 +372,12 @@ footer { text-align: center; color: var(--muted); font-size: 0.75rem; padding: 2
         <li>Custom feature requests</li>
         <li>Quarterly architecture review call</li>
       </ul>
-      <!-- TODO: swap href for Polar.sh checkout link once account is set up -->
-      <a class="tier-cta" href="https://github.com/sponsors/atvirokodosprendimai" target="_blank" rel="noopener">Become a mesh operator →</a>
+      <a class="tier-cta" href="https://polar.sh/checkout?productId=eb20683e-55ea-4354-9d8c-070e55a4eff5" target="_blank" rel="noopener noreferrer">Become a mesh operator →</a>
     </div>
   </div>
   <div class="sponsor-note">
-    Payment via <a href="https://github.com/sponsors/atvirokodosprendimai" target="_blank" rel="noopener">GitHub Sponsors</a> — benefits activate within minutes.
-    No GitHub account? Any verifiable recurring payment qualifies &mdash; <a href="https://github.com/atvirokodosprendimai/wgmesh/issues/new?title=Sponsor+verification&labels=sponsor">open an issue</a> with your receipt.
+    Payment via <a href="https://polar.sh/atvirokodosprendimai" target="_blank" rel="noopener noreferrer">Polar.sh</a> — one-click checkout, benefits activate within minutes.
+    Questions? <a href="https://github.com/atvirokodosprendimai/wgmesh/issues/new?title=Sponsor+question&labels=sponsor">Open an issue</a>.
   </div>
 </div>
 
@@ -715,6 +715,53 @@ const DIRECT_API = `https://api.github.com/repos/${OWNER}/${REPO}`;
 let API = CHIMNEY_PROXY;
 let usingProxy = true;
 
+// --- Org-level repo discovery ---
+let orgMode = false;
+let orgRepos = [];
+let selectedRepo = ''; // empty = all repos (aggregate view)
+
+async function discoverRepos() {
+  try {
+    const res = await fetch(`${window.location.origin}/api/github/org/repos`, { cache: 'no-store' });
+    if (!res.ok) return;
+    const data = await res.json();
+    orgRepos = data.repos || [];
+    orgMode = data.mode === 'org';
+
+    const sel = document.getElementById('repo-selector');
+    if (orgMode && orgRepos.length > 1) {
+      sel.style.display = '';
+      // Clear existing options beyond "All repos"
+      while (sel.options.length > 1) sel.remove(1);
+      for (const r of orgRepos) {
+        const opt = document.createElement('option');
+        opt.value = r.full_name;
+        opt.textContent = r.name + (r.language ? ` (${r.language})` : '');
+        sel.appendChild(opt);
+      }
+      sel.value = selectedRepo;
+    }
+  } catch (e) {
+    console.warn('repo discovery failed:', e.message);
+  }
+}
+
+// Repo selector change handler
+document.getElementById('repo-selector').addEventListener('change', function() {
+  selectedRepo = this.value;
+  const titleEl = document.getElementById('dashboard-title');
+  if (selectedRepo) {
+    const name = selectedRepo.split('/')[1];
+    titleEl.textContent = `${name} Pipeline`;
+  } else {
+    titleEl.textContent = orgMode ? `${OWNER} Org Pipeline` : 'wgmesh Agent Pipeline';
+  }
+  // Re-fetch with new repo context
+  fetchCount = 0;
+  fetchAll();
+  fetchPipelineSummary();
+});
+
 let rateLimitRemaining = null;
 let rateLimitReset = null;
 let paused = false;
@@ -770,7 +817,10 @@ function switchToDirectAPI() {
 // Uses chimney proxy (authenticated, server-cached) with fallback to direct GitHub API.
 async function ghFetch(path) {
   if (paused) throw new Error('Rate limited — waiting for reset');
-  const url = `${API}${path}`;
+  // In org mode with a selected repo, prefix path with owner/repo
+  // so chimney proxy routes to the correct GitHub repo.
+  const repoPrefix = (orgMode && selectedRepo) ? `/${selectedRepo}` : '';
+  const url = `${API}${repoPrefix}${path}`;
   const headers = { 'Accept': 'application/vnd.github+json' };
 
   // Add If-None-Match header if we have a cached ETag for this path
@@ -974,7 +1024,7 @@ async function fetchPipelineSummary() {
     if (mergeEl && data.last_merged_pr) {
       const pr = data.last_merged_pr;
       const when = pr.merged_at ? new Date(pr.merged_at).toLocaleDateString() : '';
-      mergeEl.innerHTML = `<a href="https://github.com/atvirokodosprendimai/wgmesh/pull/${pr.number}" target="_blank">#${pr.number}</a> ${when}`;
+      mergeEl.innerHTML = `<a href="https://github.com/atvirokodosprendimai/wgmesh/pull/${escAttr(pr.number)}" target="_blank" rel="noopener noreferrer">#${escHtml(pr.number)}</a> ${escHtml(when)}`;
     }
   } catch (e) {
     console.warn('pipeline/summary fetch failed (local dev?):', e.message);
@@ -1558,6 +1608,8 @@ function renderMem0(gooseRuns) {
 }
 
 // ── Init ──
+discoverRepos(); // discover org repos (updates selector if org mode)
+setInterval(discoverRepos, 900000); // refresh repo list every 15min
 fetchAll();
 fetchPipelineSummary(); // chimney-native endpoint — no GitHub rate limit cost
 setInterval(fetchAll, REFRESH_MS); // 5 min — reduces API call volume to stay within unauthenticated rate limits

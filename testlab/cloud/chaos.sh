@@ -29,14 +29,48 @@
 
 set -euo pipefail
 
+# Validate a value is a non-negative integer (0 or greater).
+# Usage: _validate_int <value> <label>
+_validate_int() {
+    local val="$1" label="$2"
+    if ! [[ "$val" =~ ^[0-9]+$ ]]; then
+        log_error "chaos: invalid $label '$val' (must be a non-negative integer)"
+        return 1
+    fi
+}
+
+# Validate a value is an integer in 0-100 range (for tc netem percent params).
+# Usage: _validate_pct <value> <label>
+_validate_pct() {
+    _validate_int "$1" "$2" || return 1
+    if [ "$1" -gt 100 ]; then
+        log_error "chaos: $2 '$1' exceeds 100"
+        return 1
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # tc netem impairments (applied to eth0 / default interface)
 # ---------------------------------------------------------------------------
 
-# Detect the primary network interface on a node.
+# Detect the primary network interface on a node (cached per-node).
+# Returns non-zero if detection fails.
+declare -A _CHAOS_IFACE_CACHE=()
 _get_iface() {
     local node="$1"
-    run_on "$node" "ip route show default | awk '/default/ {print \$5}' | head -1"
+    if [ -n "${_CHAOS_IFACE_CACHE[$node]:-}" ]; then
+        echo "${_CHAOS_IFACE_CACHE[$node]}"
+        return
+    fi
+    local iface
+    iface=$(run_on "$node" "ip route show default | awk '/default/ {print \$5}' | head -1")
+    if [ -n "$iface" ]; then
+        _CHAOS_IFACE_CACHE["$node"]="$iface"
+        echo "$iface"
+        return
+    fi
+    echo "chaos.sh: failed to detect default network interface on node '${node}'" >&2
+    return 1
 }
 
 # Apply a tc netem impairment.
@@ -49,24 +83,50 @@ _get_iface() {
 #   reorder <percent> <correlation>    — packet reordering
 #   duplicate <percent>                — packet duplication
 #   corrupt <percent>                  — bit-level corruption
+#
+# For severe impairments (>=50% packet loss), a remote auto-clear timer is
+# scheduled as a safety net.  This ensures the impairment is removed even if
+# SSH becomes unreliable due to the impairment itself (since tc netem on eth0
+# affects all traffic, including the SSH control plane).  The timer defaults
+# to CHAOS_AUTOCLEAR_SECS (default: 240s).
 chaos_apply() {
     local node="$1" type="$2"; shift 2
     emit_event "chaos_apply" "$node" "type=$type" "params=$*"
     local iface
     iface=$(_get_iface "$node")
 
+    # Kill any pending auto-clear timer from a previous chaos_apply
+    run_on_ok "$node" "[ -f /tmp/chaos-autoclear.pid ] && kill \$(cat /tmp/chaos-autoclear.pid) 2>/dev/null; rm -f /tmp/chaos-autoclear.pid"
+
     # Clear any existing qdisc first
     run_on_ok "$node" "tc qdisc del dev $iface root 2>/dev/null"
+
+    # Validate and resolve auto-clear timeout for severe impairments
+    local autoclear_secs="${CHAOS_AUTOCLEAR_SECS:-240}"
+    if ! [[ "$autoclear_secs" =~ ^[0-9]+$ ]] || [ "$autoclear_secs" -le 0 ]; then
+        autoclear_secs=240
+    fi
 
     case "$type" in
         loss)
             local pct="${1:?loss percent required}"
-            run_on "$node" "tc qdisc add dev $iface root netem loss ${pct}%"
-            log_info "chaos: $node — ${pct}% packet loss on $iface"
+            _validate_pct "$pct" "loss percent" || return 1
+            if [ "${pct}" -ge 50 ]; then
+                # For severe loss: apply qdisc AND schedule auto-clear in a
+                # SINGLE SSH command.  This avoids a second SSH call that would
+                # go through the already-impaired network.
+                run_on "$node" "tc qdisc add dev $iface root netem loss ${pct}% && bash -c 'echo \$\$ > /tmp/chaos-autoclear.pid; (sleep $autoclear_secs; tc qdisc del dev $iface root 2>/dev/null; rm -f /tmp/chaos-autoclear.pid) </dev/null >/dev/null 2>&1 &'"
+                log_info "chaos: $node — ${pct}% packet loss on $iface (auto-clear in ${autoclear_secs}s)"
+            else
+                run_on "$node" "tc qdisc add dev $iface root netem loss ${pct}%"
+                log_info "chaos: $node — ${pct}% packet loss on $iface"
+            fi
             ;;
         delay)
             local ms="${1:?delay ms required}"
+            _validate_int "$ms" "delay ms" || return 1
             local jitter="${2:-0}"
+            _validate_int "$jitter" "jitter ms" || return 1
             if [ "$jitter" -gt 0 ] 2>/dev/null; then
                 run_on "$node" "tc qdisc add dev $iface root netem delay ${ms}ms ${jitter}ms distribution normal"
             else
@@ -76,22 +136,31 @@ chaos_apply() {
             ;;
         throttle)
             local kbit="${1:?kbit required}"
+            _validate_int "$kbit" "throttle kbit" || return 1
+            if [ "$kbit" -le 0 ]; then
+                log_error "chaos: invalid throttle kbit '$kbit' (must be greater than zero)"
+                return 1
+            fi
             run_on "$node" "tc qdisc add dev $iface root tbf rate ${kbit}kbit burst 32kbit latency 400ms"
             log_info "chaos: $node — throttled to ${kbit}kbit on $iface"
             ;;
         reorder)
             local pct="${1:?reorder percent required}"
+            _validate_pct "$pct" "reorder percent" || return 1
             local corr="${2:-50}"
+            _validate_pct "$corr" "reorder correlation" || return 1
             run_on "$node" "tc qdisc add dev $iface root netem delay 10ms reorder ${pct}% ${corr}%"
             log_info "chaos: $node — ${pct}% reorder (corr=${corr}%) on $iface"
             ;;
         duplicate)
             local pct="${1:?duplicate percent required}"
+            _validate_pct "$pct" "duplicate percent" || return 1
             run_on "$node" "tc qdisc add dev $iface root netem duplicate ${pct}%"
             log_info "chaos: $node — ${pct}% duplication on $iface"
             ;;
         corrupt)
             local pct="${1:?corrupt percent required}"
+            _validate_pct "$pct" "corrupt percent" || return 1
             run_on "$node" "tc qdisc add dev $iface root netem corrupt ${pct}%"
             log_info "chaos: $node — ${pct}% corruption on $iface"
             ;;
@@ -108,7 +177,8 @@ chaos_clear() {
     emit_event "chaos_clear" "$node"
     local iface
     iface=$(_get_iface "$node")
-    run_on_ok "$node" "tc qdisc del dev $iface root 2>/dev/null"
+    # Kill any pending auto-clear timer and remove the impairment
+    run_on_ok "$node" "[ -f /tmp/chaos-autoclear.pid ] && kill \$(cat /tmp/chaos-autoclear.pid) 2>/dev/null; rm -f /tmp/chaos-autoclear.pid; tc qdisc del dev $iface root 2>/dev/null"
     log_info "chaos: $node — cleared tc impairments"
 }
 
@@ -245,6 +315,7 @@ chaos_heal_partition() {
 # Skew the system clock forward by N minutes.
 chaos_skew_clock() {
     local node="$1" minutes="$2"
+    _validate_int "$minutes" "clock skew minutes" || return 1
     run_on "$node" "timedatectl set-ntp false && date -s '+${minutes} minutes'"
     log_info "chaos: $node — clock skewed +${minutes}min"
 }

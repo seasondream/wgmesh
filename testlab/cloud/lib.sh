@@ -87,42 +87,48 @@ emit_event() {
 # SSH helpers
 # ---------------------------------------------------------------------------
 
+# Shared SSH options — single source of truth for all remote commands.
+# ConnectTimeout=10s, keepalive every 15s with 4 retries (~60s dead session kill).
+# Populated lazily (SSH_KEY_FILE must be set before first use).
+SSH_OPTS=()
+_ensure_ssh_opts() {
+    [ ${#SSH_OPTS[@]} -gt 0 ] && return
+    SSH_OPTS=(
+        -o StrictHostKeyChecking=no
+        -o UserKnownHostsFile=/dev/null
+        -o ConnectTimeout=10
+        -o ServerAliveInterval=15
+        -o ServerAliveCountMax=4
+        -o LogLevel=ERROR
+        -i "$SSH_KEY_FILE"
+    )
+}
+
 # Run a command on a remote node via SSH.
 # Usage: run_on <node-name> <command...>
 run_on() {
+    _ensure_ssh_opts
     local node="$1"; shift
     local ip="${NODE_IPS[$node]}"
-    ssh -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -o ConnectTimeout=10 \
-        -o LogLevel=ERROR \
-        -i "$SSH_KEY_FILE" \
-        "root@${ip}" "$@"
+    ssh "${SSH_OPTS[@]}" "root@${ip}" "$@"
 }
 
 # Run a command on a remote node, tolerating failure.
-# Returns the exit code without aborting.
+# Always returns 0 — errors are silently swallowed.
 run_on_ok() {
+    _ensure_ssh_opts
     local node="$1"; shift
     local ip="${NODE_IPS[$node]}"
-    ssh -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -o ConnectTimeout=10 \
-        -o LogLevel=ERROR \
-        -i "$SSH_KEY_FILE" \
-        "root@${ip}" "$@" 2>/dev/null || true
+    ssh "${SSH_OPTS[@]}" "root@${ip}" "$@" 2>/dev/null || true
 }
 
 # Copy a file to a remote node.
 # Usage: copy_to <node-name> <local-path> <remote-path>
 copy_to() {
+    _ensure_ssh_opts
     local node="$1" src="$2" dst="$3"
     local ip="${NODE_IPS[$node]}"
-    scp -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null \
-        -o LogLevel=ERROR \
-        -i "$SSH_KEY_FILE" \
-        "$src" "root@${ip}:${dst}"
+    scp "${SSH_OPTS[@]}" "$src" "root@${ip}:${dst}"
 }
 
 # Run a command on ALL nodes in parallel, wait for all.
@@ -254,20 +260,15 @@ wg_handshake_age() {
 }
 
 # Count active WG peers (with handshake < 180s) on a node.
+# Uses awk instead of a while-read pipe to avoid subshell variable loss.
 wg_active_peer_count() {
     local node="$1"
     run_on "$node" "
         now=\$(date +%s)
-        count=0
-        wg show $WG_INTERFACE dump 2>/dev/null | tail -n +2 | while IFS=$'\t' read -r pubkey psk endpoint aips handshake rx tx ka; do
-            if [ \"\$handshake\" -gt 0 ] 2>/dev/null; then
-                age=\$(( now - handshake ))
-                if [ \$age -lt 180 ]; then
-                    count=\$(( count + 1 ))
-                fi
-            fi
-        done
-        echo \$count
+        wg show $WG_INTERFACE dump 2>/dev/null | tail -n +2 | awk -F'\t' -v now=\"\$now\" '
+            \$6 > 0 && (now - \$6) < 180 { count++ }
+            END { print count+0 }
+        '
     " 2>/dev/null
 }
 
@@ -330,17 +331,22 @@ mesh_transfer() {
     run_on_ok "$to" "pkill -f 'nc.*-l.*$port' 2>/dev/null"
     sleep 1
 
-    # Start receiver: listen, write to file
-    run_on "$to" "
-        rm -f /tmp/mesh-rx.bin /tmp/mesh-rx.sha256
+    # Start receiver: listen, write to file.
+    # Capture the nc PID so we can wait for it to exit after transfer.
+    local nc_pid
+    nc_pid=$(run_on "$to" "
+        rm -f /tmp/mesh-rx.bin
         nc -l $port > /tmp/mesh-rx.bin 2>/dev/null &
         echo \$!
-    " > "/tmp/_nc_pid_$$" 2>/dev/null
+    " 2>/dev/null)
 
-    # Wait for listener to be ready by probing from the sender side.
+    # Wait for listener to be ready by checking the listening socket on the
+    # receiver.  IMPORTANT: Do NOT use 'nc -z' from the sender — OpenBSD nc -l
+    # (without -k) accepts one connection then exits, so a probe would consume
+    # the listener before the real data transfer begins.
     local attempt listener_ready=0
     for attempt in {1..20}; do
-        if run_on "$from" "nc -z -w 1 $to_ip $port" 2>/dev/null; then
+        if run_on "$to" "ss -tlnp 2>/dev/null | grep -q ':${port} '" 2>/dev/null; then
             listener_ready=1
             break
         fi
@@ -348,9 +354,8 @@ mesh_transfer() {
     done
 
     if [ "$listener_ready" -ne 1 ]; then
-        log_error "mesh_transfer $from->$to: listener on $to_ip:$port not reachable after $attempt attempts"
+        log_error "mesh_transfer $from->$to: listener on $to:$port not ready after $attempt attempts"
         run_on_ok "$to" "pkill -f 'nc.*-l.*$port' 2>/dev/null; rm -f /tmp/mesh-rx.bin"
-        rm -f "/tmp/_nc_pid_$$"
         return 1
     fi
 
@@ -362,29 +367,39 @@ mesh_transfer() {
 
     # Send the data
     run_on "$from" "nc -w 10 $to_ip $port < /tmp/mesh-tx.bin" 2>/dev/null || true
-    sleep 2
+
+    # Wait for the receiver nc to exit (it exits when the sender closes the
+    # TCP connection and all data is written).  Uses a single SSH session
+    # with an internal timeout to avoid repeated SSH calls per second.
+    if [ -n "$nc_pid" ]; then
+        run_on "$to" "timeout 30 sh -c 'while kill -0 $nc_pid 2>/dev/null; do sleep 1; done'" 2>/dev/null || true
+    fi
 
     # Get receiver checksum
     local dst_hash
     dst_hash=$(run_on "$to" "sha256sum /tmp/mesh-rx.bin 2>/dev/null | awk '{print \$1}'" 2>/dev/null)
 
+    # Capture file sizes for diagnostics before cleanup
+    local src_size dst_size
+    src_size=$(run_on "$from" "wc -c < /tmp/mesh-tx.bin 2>/dev/null" 2>/dev/null)
+    dst_size=$(run_on "$to" "wc -c < /tmp/mesh-rx.bin 2>/dev/null" 2>/dev/null)
+
     # Cleanup
     run_on_ok "$to" "pkill -f 'nc.*-l.*$port' 2>/dev/null; rm -f /tmp/mesh-rx.bin"
     run_on_ok "$from" "rm -f /tmp/mesh-tx.bin"
-    rm -f "/tmp/_nc_pid_$$"
 
     if [ -z "$src_hash" ] || [ -z "$dst_hash" ]; then
-        log_error "mesh_transfer $from->$to: failed to compute checksums (src='$src_hash' dst='$dst_hash')"
+        log_error "mesh_transfer $from->$to: failed to compute checksums (src='$src_hash' dst='$dst_hash' src_size=$src_size dst_size=$dst_size)"
         return 1
     fi
 
     if [ "$src_hash" = "$dst_hash" ]; then
-        log_info "mesh_transfer $from->$to: ${size_mb}MB OK (sha256 match)"
+        log_info "mesh_transfer $from->$to: ${size_mb}MB OK (sha256 match, ${dst_size} bytes)"
         emit_event "data_transfer" "$from->$to" "size_mb=$size_mb" "result=ok"
         return 0
     else
-        log_error "mesh_transfer $from->$to: checksum MISMATCH (src=$src_hash dst=$dst_hash)"
-        emit_event "data_transfer" "$from->$to" "size_mb=$size_mb" "result=mismatch"
+        log_error "mesh_transfer $from->$to: checksum MISMATCH (src=$src_hash[$src_size] dst=$dst_hash[$dst_size])"
+        emit_event "data_transfer" "$from->$to" "size_mb=$size_mb" "result=mismatch" "src_size=$src_size" "dst_size=$dst_size"
         return 1
     fi
 }
@@ -649,10 +664,14 @@ run_test() {
     tmpfile=$(mktemp)
     emit_event "test_start" "$id" "name=$name"
 
-    # Stream output in real-time while also capturing it
+    # Stream output in real-time while also capturing it.
+    # IMPORTANT: use process substitution (not a pipe) so the function runs
+    # in the CURRENT shell — this preserves global variables like NODE_MESH_IPS
+    # that test functions may modify via populate_mesh_ips.
     set +e
-    "$func" "$@" 2>&1 | tee "$tmpfile"
-    rc=${PIPESTATUS[0]}
+    "$func" "$@" > >(tee "$tmpfile") 2>&1
+    rc=$?
+    wait  # ensure tee flushes before we read tmpfile
     set -e
 
     local output

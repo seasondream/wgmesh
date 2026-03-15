@@ -474,12 +474,15 @@ test_t14_loss_80() {
     local node
     node=$(_pick_node)
 
-    chaos_apply "$node" loss 80
-    sleep 180
+    # Auto-clear fires at 170s — 10s BEFORE the soak ends — so the
+    # impairment is already gone when chaos_clear runs, avoiding SSH hangs.
+    CHAOS_AUTOCLEAR_SECS=170 chaos_apply "$node" loss 80
+    sleep 170
 
-    # Node will be evicted — expected
+    # Node will be evicted — expected.
+    # Auto-clear should have already fired; chaos_clear is best-effort cleanup.
     chaos_clear "$node"
-    sleep 30  # Allow network to settle
+    sleep 10
     restart_mesh_node "$node"
     verify_full_mesh 180
     scan_logs_for_errors

@@ -84,6 +84,7 @@ func main() {
 		listSimple = flag.Bool("list-simple", false, "List all nodes in simple format (hostname ip)")
 		deploy     = flag.Bool("deploy", false, "Deploy configuration to all nodes")
 		init       = flag.Bool("init", false, "Initialize new mesh")
+		network    = flag.String("network", "", "Custom mesh network CIDR for init (default: 10.99.0.0/16)")
 		encrypt    = flag.Bool("encrypt", false, "Encrypt state file with password (asks for password)")
 	)
 
@@ -114,7 +115,7 @@ func main() {
 	}
 
 	if *init {
-		if err := mesh.Initialize(*stateFile); err != nil {
+		if err := mesh.InitializeWithNetwork(*stateFile, *network); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed to initialize mesh: %v\n", err)
 			os.Exit(1)
 		}
@@ -181,6 +182,7 @@ FLAGS:
   -list            List all nodes
   -deploy          Deploy configuration to all nodes
   -init            Initialize new mesh state file
+  -network <CIDR>  Custom mesh network for init (default: 10.99.0.0/16)
   -encrypt         Encrypt state file with password
 
 SUBCOMMANDS (centralized mode):
@@ -190,6 +192,7 @@ SUBCOMMANDS (decentralized mode):
   init --secret                 Generate a new mesh secret
 	join --secret <SECRET>        Join a mesh network
 	     [--account <cr_...>]    Save Lighthouse API key for service commands
+	     [--mesh-subnet CIDR]    Custom mesh subnet (e.g. 192.168.100.0/24)
 	     [--no-lan-discovery]     Disable LAN multicast discovery
 	     [--no-ipv6]              Ignore IPv6 endpoints for connectivity
 	     [--force-relay]          Prefer relay path for non-LAN peers
@@ -284,6 +287,7 @@ func joinCmd() {
 	forceRelay := fs.Bool("force-relay", false, "Prefer relay path for non-LAN peers")
 	noPunching := fs.Bool("no-punching", false, "Disable NAT port punching/rendezvous")
 	introducerMode := fs.Bool("introducer", false, "Allow this node to act as rendezvous introducer")
+	meshSubnet := fs.String("mesh-subnet", "", "Custom mesh subnet CIDR (e.g. 192.168.100.0/24)")
 	pprofAddr := fs.String("pprof", "", "Enable pprof HTTP server (e.g. localhost:6060)")
 	fs.Parse(os.Args[2:])
 
@@ -337,6 +341,7 @@ func joinCmd() {
 		ForceRelay:          *forceRelay,
 		DisablePunching:     *noPunching,
 		Introducer:          *introducerMode,
+		MeshSubnet:          *meshSubnet,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create config: %v\n", err)
@@ -503,6 +508,7 @@ func statusCmd() {
 	fs := flag.NewFlagSet("status", flag.ExitOnError)
 	secret := fs.String("secret", "", "Mesh secret (required)")
 	iface := fs.String("interface", "", "WireGuard interface name (default: wg0 on non-macOS, utun20 on macOS)")
+	meshSubnet := fs.String("mesh-subnet", "", "Custom mesh subnet CIDR (e.g. 192.168.100.0/24)")
 	fs.Parse(os.Args[2:])
 
 	if *secret == "" {
@@ -515,6 +521,7 @@ func statusCmd() {
 	cfg, err := daemon.NewConfig(daemon.DaemonOpts{
 		Secret:        *secret,
 		InterfaceName: *iface,
+		MeshSubnet:    *meshSubnet,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create config: %v\n", err)
@@ -525,7 +532,11 @@ func statusCmd() {
 	fmt.Printf("===========\n")
 	fmt.Printf("Interface: %s\n", cfg.InterfaceName)
 	fmt.Printf("Network ID: %x\n", cfg.Keys.NetworkID[:8])
-	fmt.Printf("Mesh Subnet: 10.%d.0.0/16\n", cfg.Keys.MeshSubnet[0])
+	if cfg.CustomSubnet != nil {
+		fmt.Printf("Mesh Subnet: %s (custom)\n", cfg.CustomSubnet)
+	} else {
+		fmt.Printf("Mesh Subnet: 10.%d.0.0/16\n", cfg.Keys.MeshSubnet[0])
+	}
 	fmt.Printf("Mesh IPv6 Prefix: %s\n", formatIPv6Prefix(cfg.Keys.MeshPrefixV6))
 	fmt.Printf("Gossip Port: %d\n", cfg.Keys.GossipPort)
 	fmt.Printf("Rendezvous ID: %x\n", cfg.Keys.RendezvousID)
@@ -614,7 +625,7 @@ func formatIPv6Prefix(prefix [8]byte) string {
 // It properly handles missing vs corrupt files and includes the path in error messages.
 func saveAccountAPIKey(stateDir, apiKey string) {
 	accountPath := filepath.Join(stateDir, "account.json")
-	
+
 	// Try to load existing account first
 	acct, err := mesh.LoadAccount(accountPath)
 	if err != nil {
@@ -629,7 +640,7 @@ func saveAccountAPIKey(stateDir, apiKey string) {
 			return
 		}
 	}
-	
+
 	acct.APIKey = apiKey
 	if err := mesh.SaveAccount(accountPath, acct); err != nil {
 		fmt.Fprintf(os.Stderr, "Warning: failed to save account to %s: %v\n", accountPath, err)
@@ -654,6 +665,7 @@ func installServiceCmd() {
 	forceRelay := fs.Bool("force-relay", false, "Prefer relay path for non-LAN peers")
 	noPunching := fs.Bool("no-punching", false, "Disable NAT port punching/rendezvous")
 	introducerMode := fs.Bool("introducer", false, "Allow this node to act as rendezvous introducer")
+	meshSubnet := fs.String("mesh-subnet", "", "Custom mesh subnet CIDR (e.g. 192.168.100.0/24)")
 	fs.Parse(os.Args[2:])
 
 	if *secret == "" {
@@ -687,6 +699,7 @@ func installServiceCmd() {
 		ForceRelay:          *forceRelay,
 		DisablePunching:     *noPunching,
 		Introducer:          *introducerMode,
+		MeshSubnet:          *meshSubnet,
 	}
 
 	fmt.Println("Installing wgmesh systemd service...")
