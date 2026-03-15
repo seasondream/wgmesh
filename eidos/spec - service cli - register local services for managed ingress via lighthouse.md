@@ -90,11 +90,19 @@ This is the Stage 0 exit gate in [[spec - first-customer - roadmap to first payi
 
 ### Direct-to-Lighthouse (no daemon involvement)
 
-The CLI calls the Lighthouse REST API directly.
+The CLI calls the Lighthouse REST API directly via a versioned client SDK.
 No RPC to the running daemon needed — mesh IP is derived from the secret, same as `wgmesh status`.
 
 This means `service add` works even when the daemon isn't running (e.g. during setup).
 The daemon doesn't need to know about services — Lighthouse is the source of truth.
+
+### SDK dependency
+
+> **Decision:** [[decision - 2603151026 - decouple lighthouse from wgmesh into separate repo]]
+>
+> `service.go` will import a published `lighthouse-go` client SDK instead of in-tree `pkg/lighthouse` types.
+> This makes the API contract between wgmesh and Lighthouse explicit and independently versioned.
+> Breaking API changes in Lighthouse become visible as `go.mod` version bumps.
 
 ### Mesh ID derivation
 
@@ -157,7 +165,7 @@ wgmesh service remove <name>
 
 > [[main.go]] — `service` subcommand dispatch
 > [[service.go]] — service add/list/remove implementation
-> [[pkg/lighthouse/client.go]] — Lighthouse HTTP client + SRV discovery
+> `lighthouse-go` SDK — Lighthouse HTTP client + SRV discovery (external dependency, replaces in-tree `pkg/lighthouse/client.go`)
 > [[pkg/mesh/services.go]] — local service state (load/save)
 > [[pkg/mesh/account.go]] — account credential storage
 > [[pkg/crypto/derive.go]] — `MeshID()` method on DerivedKeys
