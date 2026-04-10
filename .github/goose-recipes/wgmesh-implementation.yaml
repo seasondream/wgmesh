@@ -2,57 +2,6 @@ version: "1.0.0"
 title: "wgmesh Implementation"
 description: "Implements code and/or documentation changes for wgmesh based on a specification"
 
-instructions: |
-  You are implementing changes for the wgmesh project, a Go-based WireGuard mesh network builder.
-
-  ## Project Context
-  - Language: Go 1.25, module: github.com/atvirokodosprendimai/wgmesh
-  - Build: `go build ./...` must succeed
-  - Test: `go test ./...` must pass
-  - Lint: `go vet ./...` must be clean
-  - Format: code must be `gofmt` formatted
-  - Always handle errors with context wrapping: `if err != nil { return fmt.Errorf("context: %w", err) }`
-  - Use standard library where possible
-  - Do NOT modify files outside the scope of the specification
-
-  ## CRITICAL: Use Real Types
-
-  Before writing ANY code, you MUST read the existing source files to understand:
-  - What types already exist (do NOT guess or invent type names)
-  - What fields structs have (do NOT assume fields exist)
-  - What function signatures look like (do NOT change existing signatures)
-
-  If a codebase context file exists at /tmp/codebase-context.md, read it first — it lists every exported symbol.
-
-  ## Deliverables Checklist
-
-  Based on the specification's "Deliverables" field:
-  - If "code" or "code + documentation" → Implement the code changes
-  - If "documentation" or "code + documentation" → Generate/update documentation files
-
-  ## Implementation Steps
-
-  1. Read the specification file thoroughly
-  2. If /tmp/codebase-context.md exists, read it to see all exported types
-  3. Read EVERY file listed in "Affected Files" using `cat` — understand the real types and signatures
-  4. Read existing test files in the same packages to understand test patterns used
-  5. Implement the changes described in "Proposed Approach" using ONLY types that exist
-  6. Run `go build ./...` — if it fails, read the error, fix it, repeat until clean
-  7. Run `go test ./...` — if tests fail, read the error, fix it, repeat until clean
-  8. Run `go vet ./...` and fix any issues
-  9. Run `gofmt -w .` to fix formatting
-  10. Run `go build ./... && go test ./... && go vet ./...` one final time to confirm everything passes
-
-  IMPORTANT:
-  - NEVER reference a type, field, or function that you haven't verified exists by reading the source
-  - If the spec suggests code that doesn't match the real codebase, adapt to match reality
-  - Test error messages must match EXACTLY what your code produces
-  - If the spec classification is "wont-do" or "needs-info", do NOT implement anything
-
-prompt: |
-  Implement the specification in {{ spec_file }}.
-  Read the spec file first, then follow the implementation steps in your instructions.
-
 parameters:
   - key: spec_file
     input_type: file
@@ -63,6 +12,40 @@ extensions:
   - type: builtin
     name: developer
 
-# Provider and model are configured via env vars in goose-build.yml:
-#   OPENAI_API_KEY, OPENAI_HOST, OPENAI_BASE_PATH
-# Build verification is handled in the workflow's "Check for changes" step.
+prompt: |
+  You are implementing changes for the wgmesh project, a Go-based WireGuard mesh network builder.
+
+  Project Context:
+  - Language: Go 1.25, module: github.com/atvirokodosprendimai/wgmesh
+  - Build: go build ./... must succeed
+  - Test: go test ./... must pass
+  - Lint: go vet ./... must be clean
+  - Format: code must be gofmt formatted
+  - Always handle errors with context wrapping
+  - Use standard library where possible
+  - Do NOT modify files outside the scope of the specification
+
+  CRITICAL - Use Real Types:
+  Before writing ANY code, you MUST read the existing source files to understand
+  what types already exist, what fields structs have, and what function signatures
+  look like. Do NOT guess or invent type names.
+
+  If a codebase context file exists at /tmp/codebase-context.md, read it first.
+
+  Implementation Steps:
+  1. Read the specification file at {{ spec_file }} thoroughly
+  2. If /tmp/codebase-context.md exists, read it to see all exported types
+  3. Read EVERY file listed in Affected Files - understand the real types and signatures
+  4. Read existing test files in the same packages to understand test patterns
+  5. Implement the changes described in the spec using ONLY types that exist
+  6. Run go build ./... - if it fails, fix it, repeat until clean
+  7. Run go test ./... - if tests fail, fix it, repeat until clean
+  8. Run go vet ./... and fix any issues
+  9. Run gofmt -w . to fix formatting
+  10. Run go build ./... && go test ./... && go vet ./... one final time
+
+  IMPORTANT: NEVER reference a type, field, or function that you have not verified
+  exists by reading the source. If the spec suggests code that does not match the
+  real codebase, adapt to match reality.
+
+  Now implement the specification in {{ spec_file }}.
