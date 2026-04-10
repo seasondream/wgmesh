@@ -1177,7 +1177,7 @@ async function fetchAll() {
     if (isFull) {
       // Full fetch adds 2 more calls
       [closedPRs, allOpenIssues] = await Promise.all([
-        ghFetch('/pulls?state=closed&per_page=20&sort=updated&direction=desc'),
+        ghFetch('/pulls?state=closed&per_page=50&sort=updated&direction=desc'),
         ghFetch('/issues?state=open&per_page=50'),
       ]);
       cachedData.closedPRs = closedPRs;
