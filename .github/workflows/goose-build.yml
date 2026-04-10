@@ -468,6 +468,12 @@ jobs:
               body: `**Goose did not produce any code changes.** Check the [workflow run](${process.env.GITHUB_SERVER_URL}/${context.repo.owner}/${context.repo.repo}/actions/runs/${process.env.GITHUB_RUN_ID}) for details.`
             });
 
+      - name: Fail if no changes produced
+        if: steps.validate.outputs.has_changes == 'false'
+        run: |
+          echo "::error::Goose produced no code changes — marking as failure"
+          exit 1
+
       # ── Metrics ────────────────────────────────────────
       - name: Collect agent metrics
         if: always()
