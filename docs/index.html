@@ -229,7 +229,7 @@ footer { text-align: center; color: var(--muted); font-size: 0.75rem; padding: 2
 
 <div class="section-divider">
   <h2>Traction Roadmap &mdash; cloudroof.eu</h2>
-  <p>Zero-infrastructure anycast CDN built on WireGuard mesh. Measuring outcomes, not outputs.</p>
+  <p>Self-hosted CDN built on WireGuard mesh. Measuring outcomes, not outputs.</p>
   <p style="margin-top:0.5rem;font-size:0.8125rem;color:var(--muted)">
     wgmesh live:
     <span id="traction-wgmesh-version" style="color:var(--accent);font-family:monospace">loading...</span>
@@ -754,19 +754,19 @@ footer { text-align: center; color: var(--muted); font-size: 0.75rem; padding: 2
         <tr>
           <td>Lighthouse CDN Control Plane</td>
           <td class="cap-done">&#10003; Implemented</td>
-          <td><code>pkg/lighthouse</code></td>
+          <td><a href="https://github.com/atvirokodosprendimai/lighthouse">lighthouse repo</a></td>
           <td>&mdash;</td>
         </tr>
         <tr>
           <td>Edge Proxy (Caddyfile generation)</td>
           <td class="cap-done">&#10003; Implemented</td>
-          <td><code>pkg/lighthouse/xds.go</code></td>
+          <td><a href="https://github.com/atvirokodosprendimai/lighthouse">lighthouse/xds.go</a></td>
           <td>&mdash;</td>
         </tr>
         <tr>
           <td>Federated State Sync (LWW CRDT)</td>
           <td class="cap-done">&#10003; Implemented</td>
-          <td><code>pkg/lighthouse/sync.go</code></td>
+          <td><a href="https://github.com/atvirokodosprendimai/lighthouse">lighthouse/sync.go</a></td>
           <td>&mdash;</td>
         </tr>
         <tr>
@@ -790,25 +790,25 @@ footer { text-align: center; color: var(--muted); font-size: 0.75rem; padding: 2
         <tr>
           <td>HTTP Health Checks</td>
           <td class="cap-done">&#10003; Implemented</td>
-          <td><code>pkg/lighthouse/health.go</code>, <a href="https://github.com/atvirokodosprendimai/wgmesh/issues/248">#248</a></td>
+          <td><a href="https://github.com/atvirokodosprendimai/lighthouse">lighthouse/health.go</a></td>
           <td>&mdash;</td>
         </tr>
         <tr>
           <td>Origin Lockdown</td>
-          <td class="cap-partial">&#9888; Partial</td>
-          <td><code>pkg/daemon</code></td>
-          <td class="cap-partial">Yes (NOW)</td>
+          <td class="cap-blocked">&#10007; Not Started</td>
+          <td>&mdash;</td>
+          <td>&mdash;</td>
         </tr>
         <tr>
           <td>GeoDNS Routing</td>
           <td class="cap-done">&#10003; Implemented</td>
-          <td><a href="https://github.com/atvirokodosprendimai/wgmesh/issues/253">#253</a></td>
+          <td><a href="https://github.com/atvirokodosprendimai/lighthouse">lighthouse/dns.go</a></td>
           <td>&mdash;</td>
         </tr>
         <tr>
           <td>Multi-origin Failover</td>
           <td class="cap-done">&#10003; Implemented</td>
-          <td><a href="https://github.com/atvirokodosprendimai/wgmesh/issues/254">#254</a></td>
+          <td><a href="https://github.com/atvirokodosprendimai/lighthouse">lighthouse/health.go</a></td>
           <td>&mdash;</td>
         </tr>
         <tr>
