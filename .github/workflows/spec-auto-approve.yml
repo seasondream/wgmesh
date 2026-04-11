@@ -53,7 +53,7 @@ jobs:
         id: issue
         run: |
           TITLE="${{ github.event.pull_request.title }}"
-          ISSUE_NUM=$(echo "$TITLE" | grep -oP 'Issue #\K\d+' || true)
+          ISSUE_NUM=$(echo "$TITLE" | grep -oP '(?:Issue )?#\K\d+' || true)
           if [ -z "$ISSUE_NUM" ]; then
             echo "::error::Could not extract issue number from PR title: $TITLE"
             exit 1

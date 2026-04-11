@@ -22,7 +22,7 @@ jobs:
           github-token: ${{ secrets.PUSH_TOKEN }}
           script: |
             const pr = context.payload.pull_request;
-            const issueMatch = pr.title.match(/Issue #(\d+)/);
+            const issueMatch = pr.title.match(/(?:Issue )?#(\d+)/);
             if (!issueMatch) {
               core.warning('No issue number in spec PR title: ' + pr.title);
               return;
