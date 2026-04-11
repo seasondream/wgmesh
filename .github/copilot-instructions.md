@@ -89,6 +89,7 @@ When asked to triage an issue and write a specification:
 4. Open as a PR titled: `spec: Issue #{NUMBER} - {brief description}`
 5. Target the `main` branch
 6. Include only the spec file - no code changes
+7. **IMPORTANT**: Use "Addresses #{NUMBER}" (NOT "Closes") in the PR body — the issue must stay open until the implementation PR merges
 
 ## Code Examples
 

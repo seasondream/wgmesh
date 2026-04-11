@@ -41,6 +41,7 @@ jobs:
                     `The spec for issue #${issueNumber} has been approved and merged.`,
                     `Read the spec at ${specFile} and implement it.`,
                     `Open a PR with the implementation. Include "Issue #${issueNumber}" in the PR title.`,
+                    `Include "Closes #${issueNumber}" in the PR body so the issue auto-closes on merge.`,
                     `Write tests. Follow the project conventions in CLAUDE.md and .goosehints.`,
                   ].join('\n'),
                 },
