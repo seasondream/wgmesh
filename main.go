@@ -31,8 +31,6 @@ import (
 // version is set at build time via -ldflags "-X main.version=..."
 var version = "dev"
 
-const defaultStateDir = "/var/lib/wgmesh"
-
 func main() {
 	// Check for version flags first (--version or -v)
 	for _, arg := range os.Args[1:] {
@@ -888,41 +886,6 @@ func statusCmd() {
 	fmt.Println("(Run 'wg show' to see connected peers)")
 }
 
-// serviceCmd handles the "service" subcommand for service management
-func serviceCmd() {
-	if len(os.Args) < 3 {
-		fmt.Fprintln(os.Stderr, "Usage: wgmesh service <action>")
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "Actions:")
-		fmt.Fprintln(os.Stderr, "  status      Show service status")
-		fmt.Fprintln(os.Stderr, "  start       Start the wgmesh service")
-		fmt.Fprintln(os.Stderr, "  stop        Stop the wgmesh service")
-		fmt.Fprintln(os.Stderr, "  restart     Restart the wgmesh service")
-		os.Exit(1)
-	}
-
-	action := os.Args[2]
-
-	switch action {
-	case "status":
-		status, err := daemon.ServiceStatus()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("Service Status: %s\n", status)
-
-	case "start", "stop", "restart":
-		fmt.Fprintf(os.Stderr, "Service management via 'systemctl' is recommended:\n")
-		fmt.Fprintf(os.Stderr, "  systemctl %s wgmesh\n", action)
-		os.Exit(1)
-
-	default:
-		fmt.Fprintf(os.Stderr, "Unknown action: %s\n", action)
-		fmt.Fprintln(os.Stderr, "Available actions: status, start, stop, restart")
-		os.Exit(1)
-	}
-}
 
 // qrCmd handles the "qr" subcommand - displays secret as a text-based QR code
 func qrCmd() {
