@@ -838,11 +838,25 @@ func (d *Daemon) applyDesiredPeerConfigs(desired map[string]*desiredPeerConfig) 
 		d.lastAppliedPeerConfigs[pubKey] = signature
 		d.appliedMu.Unlock()
 
-		// Use per-peer PSK if set, otherwise use global PSK
-		psk := d.config.Keys.PSK
+		// Determine which PSK to use
+		// Priority: per-peer PSK > global PSK > zero PSK
+		var psk [32]byte
+		var pskApplied string
 		if cfg.peer.PSK != [32]byte{} {
 			psk = cfg.peer.PSK
+			pskApplied = "per-peer"
+		} else if d.config.Keys.PSK != [32]byte{} {
+			psk = d.config.Keys.PSK
+			pskApplied = "global"
+		} else {
+			pskApplied = "none"
 		}
+
+		slog.Debug("Configuring peer",
+			"peer", shortKey(pubKey),
+			"endpoint", cfg.peer.Endpoint,
+			"psk", pskApplied,
+			"allowed_ips", allowedCSV)
 
 		if err := wireguard.SetPeer(d.config.InterfaceName, pubKey, psk, cfg.peer.Endpoint, allowedCSV); err != nil {
 			// Rollback the optimistic write on failure

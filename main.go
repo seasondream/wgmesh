@@ -1231,12 +1231,13 @@ func createRPCServer(d *daemon.Daemon, socketPath string) (daemon.RPCServer, err
 // peersCmd handles the "peers" subcommand for querying the daemon via RPC
 func peersCmd() {
 	if len(os.Args) < 3 {
-		fmt.Fprintln(os.Stderr, "Usage: wgmesh peers <list|count|get>")
+		fmt.Fprintln(os.Stderr, "Usage: wgmesh peers <list|count|get|manage>")
 		fmt.Fprintln(os.Stderr, "")
 		fmt.Fprintln(os.Stderr, "Commands:")
 		fmt.Fprintln(os.Stderr, "  list            List all active peers")
 		fmt.Fprintln(os.Stderr, "  count           Show peer counts")
 		fmt.Fprintln(os.Stderr, "  get <pubkey>    Get specific peer by public key")
+		fmt.Fprintln(os.Stderr, "  manage          Interactive peer management (remove peers)")
 		os.Exit(1)
 	}
 
@@ -1268,9 +1269,11 @@ func peersCmd() {
 			os.Exit(1)
 		}
 		handlePeersGet(client, os.Args[3])
+	case "manage":
+		handlePeersManage()
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown action: %s\n", action)
-		fmt.Fprintln(os.Stderr, "Available actions: list, count, get")
+		fmt.Fprintln(os.Stderr, "Available actions: list, count, get, manage")
 		os.Exit(1)
 	}
 }
@@ -1501,4 +1504,170 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%dh", int(d.Hours()))
 	}
 	return fmt.Sprintf("%dd", int(d.Hours()/24))
+}
+
+// handlePeersManage provides an interactive interface for managing peers
+func handlePeersManage() {
+	socketPath := os.Getenv("WGMESH_SOCKET")
+	if socketPath == "" {
+		socketPath = getRPCSocketPath()
+	}
+
+	client, err := rpc.NewClient(socketPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to connect to daemon: %v\n", err)
+		fmt.Fprintln(os.Stderr, "Is wgmesh daemon running?")
+		os.Exit(1)
+	}
+	defer client.Close()
+
+	for {
+		// Get current peers
+		result, err := client.Call("peers.list", nil)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "RPC error: %v\n", err)
+			os.Exit(1)
+		}
+
+		resultMap, ok := result.(map[string]interface{})
+		if !ok {
+			fmt.Fprintln(os.Stderr, "Invalid response format")
+			os.Exit(1)
+		}
+
+		peersData, ok := resultMap["peers"].([]interface{})
+		if !ok {
+			fmt.Fprintln(os.Stderr, "Invalid peers data")
+			os.Exit(1)
+		}
+
+		if len(peersData) == 0 {
+			fmt.Println("No active peers to manage.")
+			return
+		}
+
+		// Build options for user selection
+		var options []string
+		var peerMap map[string]string = make(map[string]string)
+
+		fmt.Println("\n=== Peer Management ===")
+		for i, peerData := range peersData {
+			peer, ok := peerData.(map[string]interface{})
+			if !ok {
+				continue
+			}
+
+			pubkey, _ := peer["pubkey"].(string)
+			hostname, _ := peer["hostname"].(string)
+			meshIP, _ := peer["mesh_ip"].(string)
+
+			if hostname == "" {
+				if len(pubkey) > 16 {
+					hostname = pubkey[:16] + "..."
+				} else {
+					hostname = pubkey
+				}
+			}
+
+			label := fmt.Sprintf("%d) %s (IP: %s, PK: %s...)", i+1, hostname, meshIP, pubkey[:8])
+			options = append(options, label)
+			peerMap[label] = pubkey
+		}
+
+		options = append(options, "Quit (no changes)")
+
+		// Ask user which peer to manage
+		selectedLabel := ""
+		err = survey.AskOne(&survey.Select{
+			Message: "Select a peer to manage:",
+			Options: options,
+		}, &selectedLabel)
+
+		if err != nil || selectedLabel == options[len(options)-1] {
+			return
+		}
+
+		selectedPubkey := peerMap[selectedLabel]
+
+		// Ask what to do with this peer
+		action := ""
+		err = survey.AskOne(&survey.Select{
+			Message: "What would you like to do?",
+			Options: []string{
+				"Remove peer from WireGuard",
+				"View peer details",
+				"Back to peer list",
+			},
+		}, &action)
+
+		if err != nil || action == "Back to peer list" {
+			continue
+		}
+
+		switch action {
+		case "Remove peer from WireGuard":
+			// Confirm removal
+			confirm := false
+			survey.AskOne(&survey.Confirm{
+				Message: fmt.Sprintf("Are you sure you want to remove peer %s from the mesh?", shortKeyStr(selectedPubkey)),
+				Default: false,
+			}, &confirm)
+
+			if !confirm {
+				fmt.Println("Cancelled.")
+				continue
+			}
+
+			// Get interface name from status
+			statusResult, err := client.Call("daemon.status", nil)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to get daemon status: %v\n", err)
+				continue
+			}
+
+			statusMap, ok := statusResult.(map[string]interface{})
+			if !ok {
+				fmt.Fprintln(os.Stderr, "Invalid status format")
+				continue
+			}
+
+			iface, _ := statusMap["interface"].(string)
+			if iface == "" {
+				iface = daemon.DefaultInterface
+			}
+
+			// Remove peer
+			if err := wireguard.RemovePeer(iface, selectedPubkey); err != nil {
+				fmt.Fprintf(os.Stderr, "Failed to remove peer: %v\n", err)
+				continue
+			}
+
+			fmt.Printf("✓ Peer %s removed from WireGuard\n", shortKeyStr(selectedPubkey))
+
+		case "View peer details":
+			peerResult, err := client.Call("peers.get", map[string]interface{}{"pubkey": selectedPubkey})
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "RPC error: %v\n", err)
+				continue
+			}
+
+			peer, ok := peerResult.(map[string]interface{})
+			if !ok {
+				fmt.Fprintln(os.Stderr, "Invalid response format")
+				continue
+			}
+
+			fmt.Println("\n=== Peer Details ===")
+			fmt.Printf("Public Key: %s\n", selectedPubkey)
+			if v, ok := peer["mesh_ip"]; ok {
+				fmt.Printf("Mesh IP:    %v\n", v)
+			}
+			if v, ok := peer["endpoint"]; ok {
+				fmt.Printf("Endpoint:   %v\n", v)
+			}
+			if v, ok := peer["last_seen"]; ok {
+				fmt.Printf("Last Seen:  %v\n", v)
+			}
+		}
+	}
 }

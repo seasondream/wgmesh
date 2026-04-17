@@ -3,6 +3,7 @@ package wireguard
 import (
 	"encoding/base64"
 	"fmt"
+	"log/slog"
 	"os/exec"
 	"strconv"
 	"strings"
@@ -138,21 +139,24 @@ func ApplyFullConfiguration(client *ssh.Client, iface string, config *FullConfig
 	return nil
 }
 
-// SetPeer adds or updates a peer on the local WireGuard interface
+// SetPeer adds or updates a peer on the local WireGuard interface.
+// If psk is a zero value, no PSK is applied (preshared-key is omitted).
 func SetPeer(iface, pubKey string, psk [32]byte, endpoint, allowedIPs string) error {
 	// Build wg set command
 	args := []string{"set", iface, "peer", pubKey}
 	var stdin strings.Reader
 	hasStdin := false
 
-	// Add PSK if non-zero
+	// Explicitly check if PSK is zero before applying
 	// NOTE: /dev/stdin is Linux/macOS only; Windows would need a named pipe or temp file.
 	var zeroKey [32]byte
+	pskStatus := "skipped"
 	if psk != zeroKey {
 		pskB64 := base64.StdEncoding.EncodeToString(psk[:])
 		args = append(args, "preshared-key", "/dev/stdin")
 		stdin = *strings.NewReader(pskB64 + "\n")
 		hasStdin = true
+		pskStatus = "applied"
 	}
 
 	if endpoint != "" {
@@ -166,6 +170,13 @@ func SetPeer(iface, pubKey string, psk [32]byte, endpoint, allowedIPs string) er
 	// Add persistent keepalive for NAT traversal
 	args = append(args, "persistent-keepalive", "25")
 
+	slog.Debug("Setting WireGuard peer",
+		"interface", iface,
+		"peer", shortKey(pubKey),
+		"preshared_key", pskStatus,
+		"endpoint", endpoint,
+		"allowed_ips", allowedIPs)
+
 	cmd := exec.Command(wgPath, args...)
 	if hasStdin {
 		cmd.Stdin = &stdin
@@ -174,6 +185,25 @@ func SetPeer(iface, pubKey string, psk [32]byte, endpoint, allowedIPs string) er
 		return fmt.Errorf("wg set failed: %s: %w", string(output), err)
 	}
 
+	return nil
+}
+
+// UnsetPeerPSK removes the pre-shared key from an existing peer.
+// This is used when a peer previously had a PSK but no longer should.
+func UnsetPeerPSK(iface, pubKey string) error {
+	args := []string{"set", iface, "peer", pubKey, "preshared-key", "/dev/stdin"}
+	// Send an empty PSK to unset (zero key)
+	stdin := strings.NewReader("\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\n")
+
+	slog.Debug("Unsetting WireGuard peer PSK",
+		"interface", iface,
+		"peer", shortKey(pubKey))
+
+	cmd := exec.Command(wgPath, args...)
+	cmd.Stdin = stdin
+	if output, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("wg set peer preshared-key unset failed: %s: %w", string(output), err)
+	}
 	return nil
 }
 
