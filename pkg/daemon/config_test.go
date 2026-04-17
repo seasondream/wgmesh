@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"encoding/base64"
 	"runtime"
 	"testing"
 )
@@ -150,5 +151,73 @@ func TestConfig_NoPunchingFlag(t *testing.T) {
 	}
 	if !cfg2.DisablePunching || !cfg2.ForceRelay {
 		t.Fatal("expected both DisablePunching and ForceRelay to be set")
+	}
+}
+
+// validWGKey returns a syntactically valid 32-byte base64 WireGuard public key.
+func validWGKey() string {
+	b := make([]byte, 32)
+	for i := range b {
+		b[i] = byte(i + 1)
+	}
+	return base64.StdEncoding.EncodeToString(b)
+}
+
+func TestNewConfig_StaticPeerValidation(t *testing.T) {
+	t.Parallel()
+	goodKey := validWGKey()
+
+	tests := []struct {
+		name    string
+		spec    StaticPeerSpec
+		wantErr bool
+	}{
+		{"empty pubkey", StaticPeerSpec{}, true},
+		{"bad base64 pubkey", StaticPeerSpec{WGPubKey: "not!!base64"}, true},
+		{"pubkey wrong length", StaticPeerSpec{WGPubKey: base64.StdEncoding.EncodeToString([]byte("tooshort"))}, true},
+		{"bad endpoint", StaticPeerSpec{WGPubKey: goodKey, Endpoint: "notanendpoint"}, true},
+		{"bad cidr", StaticPeerSpec{WGPubKey: goodKey, RoutableNetworks: []string{"notacidr"}}, true},
+		{"valid pubkey only", StaticPeerSpec{WGPubKey: goodKey}, false},
+		{"valid full spec", StaticPeerSpec{
+			WGPubKey:         goodKey,
+			Endpoint:         "1.2.3.4:51820",
+			MeshIP:           "10.0.0.5",
+			Hostname:         "opnsense",
+			RoutableNetworks: []string{"192.168.1.0/24", "10.10.0.0/16"},
+		}, false},
+	}
+
+	for _, tt := range tests {
+		tt := tt
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := NewConfig(DaemonOpts{
+				Secret:      testConfigSecret,
+				StaticPeers: []StaticPeerSpec{tt.spec},
+			})
+			if (err != nil) != tt.wantErr {
+				t.Errorf("got err=%v, wantErr=%v", err, tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestNewConfig_StaticPeersPassedThrough(t *testing.T) {
+	t.Parallel()
+	specs := []StaticPeerSpec{
+		{WGPubKey: validWGKey(), Endpoint: "5.6.7.8:51820", MeshIP: "10.0.0.10"},
+	}
+	cfg, err := NewConfig(DaemonOpts{
+		Secret:      testConfigSecret,
+		StaticPeers: specs,
+	})
+	if err != nil {
+		t.Fatalf("NewConfig: %v", err)
+	}
+	if len(cfg.StaticPeers) != 1 {
+		t.Errorf("expected 1 static peer in config, got %d", len(cfg.StaticPeers))
+	}
+	if cfg.StaticPeers[0].MeshIP != "10.0.0.10" {
+		t.Errorf("expected MeshIP 10.0.0.10, got %q", cfg.StaticPeers[0].MeshIP)
 	}
 }

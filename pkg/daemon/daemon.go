@@ -234,6 +234,13 @@ func (d *Daemon) Run() error {
 		log.Printf("[Health] Failed to start mesh probe server: %v", err)
 	}
 
+	d.seedStaticPeers()
+
+	// Load clients created by `wgmesh add-client`
+	if err := LoadClientsIntoStore(d.config.InterfaceName, d.peerStore); err != nil {
+		log.Printf("[Clients] Failed to load clients: %v", err)
+	}
+
 	// Start DHT discovery if configured
 	if d.dhtDiscovery != nil {
 		if err := d.dhtDiscovery.Start(); err != nil {
@@ -457,9 +464,34 @@ func (d *Daemon) reconcileLoop() {
 	}
 }
 
+// seedStaticPeers installs all operator-configured static peers into the peer
+// store. Called once after initLocalNode so that the local pubkey is known.
+func (d *Daemon) seedStaticPeers() {
+	for _, spec := range d.config.StaticPeers {
+		if spec.WGPubKey == d.localNode.WGPubKey {
+			log.Printf("[StaticPeers] Skipping self in static peer list: %s...", shortKey(spec.WGPubKey))
+			continue
+		}
+		info := &PeerInfo{
+			WGPubKey:         spec.WGPubKey,
+			Endpoint:         spec.Endpoint,
+			MeshIP:           spec.MeshIP,
+			MeshIPv6:         spec.MeshIPv6,
+			RoutableNetworks: spec.RoutableNetworks,
+			Hostname:         spec.Hostname,
+		}
+		d.peerStore.AddStaticPeer(info)
+		log.Printf("[StaticPeers] Registered static peer %s... (%s)", shortKey(spec.WGPubKey), spec.Hostname)
+	}
+}
+
 // reconcile updates WireGuard configuration based on discovered peers
 func (d *Daemon) reconcile() {
 	start := time.Now()
+
+	// Refresh static peer timestamps so they always pass liveness checks.
+	// The daemon — not the static device — is responsible for their liveness.
+	d.peerStore.RefreshStaticLastSeen()
 
 	peers := d.peerStore.GetActive()
 	desired, relayRoutes, directStable := d.buildDesiredPeerConfigs(peers)
@@ -859,6 +891,9 @@ func (d *Daemon) staleCleanupLoop() {
 		case <-ticker.C:
 			removed := d.peerStore.CleanupStale()
 			for _, pubKey := range removed {
+				if d.peerStore.IsStaticPeer(pubKey) { // defensive; CleanupStale already skips statics
+					continue
+				}
 				if err := d.removePeer(pubKey); err != nil {
 					log.Printf("[Peers] Failed to remove stale peer %s: %v", shortKey(pubKey), err)
 				}
@@ -1293,6 +1328,10 @@ func (d *Daemon) evictPeerFromPool(peer *PeerInfo) {
 	if peer == nil || peer.WGPubKey == "" {
 		return
 	}
+	if d.peerStore.IsStaticPeer(peer.WGPubKey) {
+		log.Printf("[Health] Skipping eviction of static peer %s...", shortKey(peer.WGPubKey))
+		return
+	}
 	log.Printf("[Health] Evicting unresponsive peer %s... from active pool", shortKey(peer.WGPubKey))
 	d.markTemporarilyOffline(peer.WGPubKey)
 	d.peerStore.Remove(peer.WGPubKey)
@@ -1446,6 +1485,15 @@ func (d *Daemon) RunWithDHTDiscovery() error {
 	// Restore peers from cache for faster startup
 	RestoreFromCache(d.config.InterfaceName, d.peerStore)
 
+	// Seed static peers after cache restore so cache endpoint data is preserved
+	// when the spec only supplies a pubkey; AddStaticPeer promotes the entry.
+	d.seedStaticPeers()
+
+	// Load clients created by `wgmesh add-client`
+	if err := LoadClientsIntoStore(d.config.InterfaceName, d.peerStore); err != nil {
+		log.Printf("[Clients] Failed to load clients: %v", err)
+	}
+
 	// Start peer cache saver (cancelled via daemon context)
 	d.wg.Add(1)
 	go func() {
@@ -1573,6 +1621,12 @@ func (d *Daemon) handleSIGHUP() {
 		return
 	}
 	d.reloadConfig(opts)
+
+	// Reload clients on SIGHUP so new `add-client` entries take effect
+	if err := LoadClientsIntoStore(d.config.InterfaceName, d.peerStore); err != nil {
+		log.Printf("[Clients] Failed to reload clients: %v", err)
+	}
+
 	d.reconcile()
 }
 

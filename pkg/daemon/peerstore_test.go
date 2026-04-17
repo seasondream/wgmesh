@@ -488,3 +488,131 @@ func TestPeerStoreMaxPeersAfterCleanup(t *testing.T) {
 		t.Errorf("expected 1 peer after cleanup and insert, got %d", ps.Count())
 	}
 }
+
+func TestStaticPeerNeverEvicted(t *testing.T) {
+	t.Parallel()
+	ps := NewPeerStore()
+	ps.AddStaticPeer(&PeerInfo{
+		WGPubKey: "statickey1",
+		MeshIP:   "10.0.0.99",
+		Endpoint: "1.2.3.4:51820",
+	})
+
+	// Force LastSeen to ancient so CleanupStale would normally evict it
+	ps.mu.Lock()
+	ps.peers["statickey1"].LastSeen = time.Now().Add(-24 * time.Hour)
+	ps.mu.Unlock()
+
+	removed := ps.CleanupStale()
+	if len(removed) != 0 {
+		t.Errorf("CleanupStale evicted a static peer: %v", removed)
+	}
+	if _, ok := ps.Get("statickey1"); !ok {
+		t.Error("static peer was removed from store after CleanupStale")
+	}
+}
+
+func TestStaticPeerAppearsInGetActiveAfterRefresh(t *testing.T) {
+	t.Parallel()
+	ps := NewPeerStore()
+	ps.AddStaticPeer(&PeerInfo{
+		WGPubKey: "statickey2",
+		MeshIP:   "10.0.0.100",
+	})
+
+	// Force stale LastSeen
+	ps.mu.Lock()
+	ps.peers["statickey2"].LastSeen = time.Now().Add(-24 * time.Hour)
+	ps.mu.Unlock()
+
+	// Before refresh: not in active set
+	active := ps.GetActive()
+	for _, p := range active {
+		if p.WGPubKey == "statickey2" {
+			t.Error("stale static peer should not appear in GetActive before refresh")
+		}
+	}
+
+	ps.RefreshStaticLastSeen()
+
+	// After refresh: appears in active set
+	active = ps.GetActive()
+	found := false
+	for _, p := range active {
+		if p.WGPubKey == "statickey2" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("static peer should appear in GetActive after RefreshStaticLastSeen")
+	}
+}
+
+func TestRemoveDoesNotRemoveStaticPeer(t *testing.T) {
+	t.Parallel()
+	ps := NewPeerStore()
+	ps.AddStaticPeer(&PeerInfo{
+		WGPubKey: "statickey3",
+		MeshIP:   "10.0.0.101",
+	})
+
+	ps.Remove("statickey3")
+
+	if _, ok := ps.Get("statickey3"); !ok {
+		t.Error("Remove() must not evict a static peer")
+	}
+	if !ps.IsStaticPeer("statickey3") {
+		t.Error("static peer should still be in staticPeers after Remove()")
+	}
+}
+
+func TestIsStaticPeer(t *testing.T) {
+	t.Parallel()
+	ps := NewPeerStore()
+	ps.AddStaticPeer(&PeerInfo{WGPubKey: "static1", MeshIP: "10.0.0.50"})
+	ps.Update(&PeerInfo{WGPubKey: "dynamic1", MeshIP: "10.0.0.51"}, "dht")
+
+	if !ps.IsStaticPeer("static1") {
+		t.Error("expected static1 to be static")
+	}
+	if ps.IsStaticPeer("dynamic1") {
+		t.Error("expected dynamic1 to not be static")
+	}
+	if ps.IsStaticPeer("nonexistent") {
+		t.Error("expected nonexistent key to return false")
+	}
+}
+
+func TestAddStaticPeerUpgradesExistingDynamic(t *testing.T) {
+	t.Parallel()
+	ps := NewPeerStore()
+
+	// First seen dynamically (e.g., from peer cache restore)
+	ps.Update(&PeerInfo{
+		WGPubKey: "upgrade1",
+		MeshIP:   "10.0.0.60",
+		Endpoint: "5.5.5.5:51820",
+	}, "cache")
+
+	// Then operator declares it static
+	ps.AddStaticPeer(&PeerInfo{
+		WGPubKey: "upgrade1",
+		Hostname: "opnsense",
+	})
+
+	if !ps.IsStaticPeer("upgrade1") {
+		t.Error("peer should be promoted to static after AddStaticPeer")
+	}
+
+	// Cache endpoint should be preserved (AddStaticPeer only overwrites non-empty fields)
+	p, ok := ps.Get("upgrade1")
+	if !ok {
+		t.Fatal("peer should still exist")
+	}
+	if p.Endpoint != "5.5.5.5:51820" {
+		t.Errorf("existing endpoint should be preserved, got %q", p.Endpoint)
+	}
+	if p.Hostname != "opnsense" {
+		t.Errorf("hostname from static spec should be applied, got %q", p.Hostname)
+	}
+}

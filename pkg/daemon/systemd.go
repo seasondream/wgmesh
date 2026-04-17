@@ -52,6 +52,7 @@ type SystemdServiceConfig struct {
 	DisablePunching     bool
 	Introducer          bool
 	MeshSubnet          string
+	StaticPeers         []StaticPeerSpec
 	BinaryPath          string
 }
 
@@ -105,6 +106,22 @@ func GenerateSystemdUnit(cfg SystemdServiceConfig) (string, error) {
 	}
 	if cfg.MeshSubnet != "" {
 		args = append(args, "--mesh-subnet", cfg.MeshSubnet)
+	}
+	for _, sp := range cfg.StaticPeers {
+		val := sp.WGPubKey
+		if sp.Endpoint != "" || sp.MeshIP != "" || sp.Hostname != "" || len(sp.RoutableNetworks) > 0 {
+			val += "@" + sp.Endpoint
+			if sp.MeshIP != "" || sp.Hostname != "" || len(sp.RoutableNetworks) > 0 {
+				val += "," + sp.MeshIP
+			}
+			if sp.Hostname != "" || len(sp.RoutableNetworks) > 0 {
+				val += "," + sp.Hostname
+			}
+			for _, cidr := range sp.RoutableNetworks {
+				val += "," + cidr
+			}
+		}
+		args = append(args, "--static-peer", shellQuoteSystemd(val))
 	}
 
 	data := struct {

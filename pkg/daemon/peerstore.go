@@ -43,6 +43,7 @@ type PeerInfo struct {
 	MeshIPv6         string
 	Endpoint         string // best known endpoint (ip:port)
 	Introducer       bool
+	IsStatic         bool // operator-configured; never evicted by timeout
 	RoutableNetworks []string
 	LastSeen         time.Time
 	DiscoveredVia    []string       // ["lan", "dht", "gossip"]
@@ -55,13 +56,15 @@ type PeerInfo struct {
 type PeerStore struct {
 	mu          sync.RWMutex
 	peers       map[string]*PeerInfo // keyed by WG pubkey
+	staticPeers map[string]*PeerInfo // operator-configured; never evicted
 	subscribers []chan PeerEvent
 }
 
 // NewPeerStore creates a new peer store
 func NewPeerStore() *PeerStore {
 	return &PeerStore{
-		peers: make(map[string]*PeerInfo),
+		peers:       make(map[string]*PeerInfo),
+		staticPeers: make(map[string]*PeerInfo),
 	}
 }
 
@@ -330,14 +333,18 @@ func (ps *PeerStore) GetActive() []*PeerInfo {
 	return result
 }
 
-// Remove removes a peer by public key
+// Remove removes a dynamic peer by public key. Static peers are never removed.
 func (ps *PeerStore) Remove(pubKey string) {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
+	if _, isStatic := ps.staticPeers[pubKey]; isStatic {
+		return
+	}
 	delete(ps.peers, pubKey)
 }
 
-// CleanupStale removes peers that haven't been seen for too long
+// CleanupStale removes peers that haven't been seen for too long.
+// Static peers are never removed.
 func (ps *PeerStore) CleanupStale() []string {
 	ps.mu.Lock()
 	defer ps.mu.Unlock()
@@ -345,12 +352,102 @@ func (ps *PeerStore) CleanupStale() []string {
 	var removed []string
 	now := time.Now()
 	for pubKey, peer := range ps.peers {
+		if peer.IsStatic {
+			continue
+		}
 		if now.Sub(peer.LastSeen) > PeerRemoveTimeout {
 			delete(ps.peers, pubKey)
 			removed = append(removed, pubKey)
 		}
 	}
 	return removed
+}
+
+// AddStaticPeer installs an operator-configured peer that is never evicted.
+// It may be called before or after Run(); re-calling with the same pubkey
+// updates mutable fields (endpoint, routable networks) in place.
+func (ps *PeerStore) AddStaticPeer(info *PeerInfo) {
+	info.IsStatic = true
+	info.DiscoveredVia = []string{"static"}
+	if info.LastSeen.IsZero() {
+		info.LastSeen = time.Now()
+	}
+
+	var eventKey string
+	var eventKind PeerEventKind
+
+	func() {
+		ps.mu.Lock()
+		defer ps.mu.Unlock()
+
+		existing, exists := ps.peers[info.WGPubKey]
+		if !exists {
+			ps.peers[info.WGPubKey] = info
+			ps.staticPeers[info.WGPubKey] = info
+			eventKey = info.WGPubKey
+			eventKind = PeerEventNew
+			return
+		}
+		// Upgrade existing entry to static; preserve any richer dynamic data
+		// (e.g. endpoint learned from cache) but lock in static-supplied fields.
+		existing.IsStatic = true
+		if info.Endpoint != "" {
+			existing.Endpoint = info.Endpoint
+			existing.endpointMethod = "static"
+		}
+		if len(info.RoutableNetworks) > 0 {
+			existing.RoutableNetworks = info.RoutableNetworks
+		}
+		if info.MeshIP != "" {
+			existing.MeshIP = info.MeshIP
+		}
+		if info.MeshIPv6 != "" {
+			existing.MeshIPv6 = info.MeshIPv6
+		}
+		if info.Hostname != "" {
+			existing.Hostname = info.Hostname
+		}
+		ps.staticPeers[info.WGPubKey] = existing
+		eventKey = info.WGPubKey
+		eventKind = PeerEventUpdated
+	}()
+
+	if eventKey != "" {
+		ps.notify(eventKey, eventKind)
+	}
+}
+
+// IsStaticPeer reports whether pubKey was registered as a static peer.
+func (ps *PeerStore) IsStaticPeer(pubKey string) bool {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	_, ok := ps.staticPeers[pubKey]
+	return ok
+}
+
+// GetStaticPeers returns copies of all operator-configured static peers.
+func (ps *PeerStore) GetStaticPeers() []*PeerInfo {
+	ps.mu.RLock()
+	defer ps.mu.RUnlock()
+	result := make([]*PeerInfo, 0, len(ps.staticPeers))
+	for _, p := range ps.staticPeers {
+		peerCopy := *p
+		result = append(result, &peerCopy)
+	}
+	return result
+}
+
+// RefreshStaticLastSeen sets LastSeen = now for every static peer.
+// Call this at the start of each reconcile cycle so static peers always
+// pass time-based liveness checks (GetActive, IsDead, CleanupStale).
+func (ps *PeerStore) RefreshStaticLastSeen() {
+	ps.mu.Lock()
+	defer ps.mu.Unlock()
+	now := time.Now()
+	for pubKey, p := range ps.staticPeers {
+		p.LastSeen = now
+		ps.peers[pubKey] = p
+	}
 }
 
 // Count returns the number of peers

@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
@@ -16,8 +18,10 @@ import (
 	"github.com/atvirokodosprendimai/wgmesh/pkg/daemon"
 	"github.com/atvirokodosprendimai/wgmesh/pkg/mesh"
 	"github.com/atvirokodosprendimai/wgmesh/pkg/rpc"
+	"github.com/atvirokodosprendimai/wgmesh/pkg/wireguard"
 
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/skip2/go-qrcode"
 
 	// Import discovery to register the DHT factory via init()
 	_ "github.com/atvirokodosprendimai/wgmesh/pkg/discovery"
@@ -43,6 +47,9 @@ func main() {
 			return
 		case "join":
 			joinCmd()
+			return
+		case "add-client":
+			addClientCmd()
 			return
 		case "init":
 			initCmd()
@@ -200,6 +207,12 @@ SUBCOMMANDS (decentralized mode):
 	     [--force-relay]          Prefer relay path for non-LAN peers
 	     [--no-punching]          Disable NAT port punching/rendezvous
 	     [--introducer]           Enable rendezvous introducer role
+	     [--static-peer <spec>]   Add a static peer (repeatable)
+  add-client --secret <SECRET> --name <N>   Onboard a static client (mobile/OPNsense)
+	     [--interface wg0]       WireGuard interface name
+	     [--server-endpoint ip:port]  Server public endpoint for client config
+	     [--routable-networks CIDR[,CIDR...]]  CIDRs behind client
+	     [--no-qr]               Skip QR code output
   status --secret <SECRET>      Show mesh status
   qr --secret <SECRET>          Display secret as QR code (text)
 	install-service --secret ...  Install systemd service
@@ -231,6 +244,8 @@ EXAMPLES:
   wgmesh join --secret "..." --account cr_123    # Join and save API key
   wgmesh join --secret "..." --privacy           # Join with Dandelion++ privacy
   wgmesh join --secret "..." --gossip            # Enable in-mesh gossip
+  wgmesh add-client --secret "..." --name myphone --server-endpoint 1.2.3.4:51820
+    # Generate WireGuard config + QR for mobile app
 
   # Query running daemon:
   wgmesh peers list                              # List all active peers
@@ -272,6 +287,40 @@ func initCmd() {
 }
 
 // joinCmd handles the "join --secret" subcommand
+// staticPeerFlag implements flag.Value for repeated --static-peer flags.
+// Format: <pubkey>[@<ip:port>[,<meshIP>[,<hostname>[,<cidr>...]]]]
+type staticPeerFlag []daemon.StaticPeerSpec
+
+func (f *staticPeerFlag) String() string { return fmt.Sprintf("%v", []daemon.StaticPeerSpec(*f)) }
+
+func (f *staticPeerFlag) Set(value string) error {
+	pubkey, rest, hasAt := strings.Cut(value, "@")
+	pubkey = strings.TrimSpace(pubkey)
+	if pubkey == "" {
+		return fmt.Errorf("static peer: pubkey is required")
+	}
+	spec := daemon.StaticPeerSpec{WGPubKey: pubkey}
+	if hasAt && rest != "" {
+		parts := strings.Split(rest, ",")
+		if len(parts) > 0 && parts[0] != "" {
+			spec.Endpoint = strings.TrimSpace(parts[0])
+		}
+		if len(parts) > 1 {
+			spec.MeshIP = strings.TrimSpace(parts[1])
+		}
+		if len(parts) > 2 {
+			spec.Hostname = strings.TrimSpace(parts[2])
+		}
+		for _, cidr := range parts[3:] {
+			if c := strings.TrimSpace(cidr); c != "" {
+				spec.RoutableNetworks = append(spec.RoutableNetworks, c)
+			}
+		}
+	}
+	*f = append(*f, spec)
+	return nil
+}
+
 func joinCmd() {
 	fs := flag.NewFlagSet("join", flag.ExitOnError)
 	secret := fs.String("secret", "", "Mesh secret (required)")
@@ -292,6 +341,9 @@ func joinCmd() {
 	meshSubnet := fs.String("mesh-subnet", "", "Custom mesh subnet CIDR (e.g. 192.168.100.0/24)")
 	pprofAddr := fs.String("pprof", "", "Enable pprof HTTP server (e.g. localhost:6060)")
 	metricsAddr := fs.String("metrics", "", "Enable Prometheus metrics server (e.g. :9090)")
+	var staticPeers staticPeerFlag
+	fs.Var(&staticPeers, "static-peer",
+		"Add a static peer (repeatable). Format: <pubkey>[@<ip:port>[,<meshIP>[,<hostname>[,<cidr>...]]]]")
 	fs.Parse(os.Args[2:])
 
 	// If secret not provided via flag, try environment variables
@@ -343,6 +395,7 @@ func joinCmd() {
 		DisablePunching:     *noPunching,
 		Introducer:          *introducerMode,
 		MeshSubnet:          *meshSubnet,
+		StaticPeers:         []daemon.StaticPeerSpec(staticPeers),
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create config: %v\n", err)
@@ -426,6 +479,173 @@ func joinCmd() {
 		fmt.Fprintf(os.Stderr, "Daemon error: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// addClientCmd creates a new static peer device (e.g., mobile phone, OPNsense)
+func addClientCmd() {
+	fs := flag.NewFlagSet("add-client", flag.ExitOnError)
+	secret := fs.String("secret", "", "Mesh secret (required)")
+	name := fs.String("name", "", "Device name (required, e.g., 'myphone', 'opnsense')")
+	iface := fs.String("interface", "", "WireGuard interface name (default: wg0)")
+	serverEndpoint := fs.String("server-endpoint", "", "Server public endpoint (ip:port, optional)")
+	routableNetworks := fs.String("routable-networks", "", "Comma-separated CIDRs behind this client (optional)")
+	noQR := fs.Bool("no-qr", false, "Skip QR code output")
+	fs.Parse(os.Args[2:])
+
+	if *secret == "" {
+		fmt.Fprintln(os.Stderr, "Error: --secret is required")
+		os.Exit(1)
+	}
+	if *name == "" {
+		fmt.Fprintln(os.Stderr, "Error: --name is required")
+		os.Exit(1)
+	}
+
+	// Set default interface
+	if *iface == "" {
+		*iface = daemon.DefaultInterface
+	}
+
+	// Create config to derive keys and subnet
+	cfg, err := daemon.NewConfig(daemon.DaemonOpts{
+		Secret:        *secret,
+		InterfaceName: *iface,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to create config: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Load local node state to get server's public key
+	stateFile := fmt.Sprintf("/var/lib/wgmesh/%s.json", *iface)
+	var serverPubKey string
+	if data, err := os.ReadFile(stateFile); err == nil {
+		var localState struct {
+			WGPubKey string `json:"wg_pubkey"`
+		}
+		if err := json.Unmarshal(data, &localState); err == nil {
+			serverPubKey = localState.WGPubKey
+		}
+	}
+	if serverPubKey == "" {
+		fmt.Fprintf(os.Stderr, "Warning: Could not load server public key from %s\n", stateFile)
+		fmt.Fprintf(os.Stderr, "Hint: Ensure the daemon has been initialized with 'wgmesh join'\n")
+	}
+
+	// Load existing clients
+	cf, err := daemon.LoadClientsFile(*iface)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to load clients file: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Check if client already exists
+	var client *daemon.ClientEntry
+	existing := cf.FindClientByName(*name)
+	if existing != nil {
+		client = existing
+		fmt.Printf("[add-client] Client '%s' already exists (reusing keypair)\n", *name)
+	} else {
+		// Generate new keypair
+		privKey, pubKey, err := wireguard.GenerateKeyPair()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to generate WireGuard keypair: %v\n", err)
+			os.Exit(1)
+		}
+
+		// Derive mesh IP
+		meshIP := crypto.DeriveMeshIP(cfg.Keys.MeshSubnet, pubKey, *secret)
+		meshIPv6 := crypto.DeriveMeshIPv6(cfg.Keys.MeshPrefixV6, pubKey, *secret)
+
+		// Parse routable networks
+		var routables []string
+		if *routableNetworks != "" {
+			for _, cidr := range strings.Split(*routableNetworks, ",") {
+				if r := strings.TrimSpace(cidr); r != "" {
+					routables = append(routables, r)
+				}
+			}
+		}
+
+		client = &daemon.ClientEntry{
+			Name:             *name,
+			WGPubKey:         pubKey,
+			WGPrivateKey:     privKey,
+			MeshIP:           meshIP,
+			MeshIPv6:         meshIPv6,
+			RoutableNetworks: routables,
+		}
+
+		// Save to clients file
+		if err := cf.AddOrUpdateClient(*iface, *client); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to save client: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Printf("[add-client] Created new client '%s' (pubkey: %s...)\n", *name, shortKeyStr(pubKey))
+	}
+
+	// Generate wg0.conf output
+	meshSubnetPrefix := "10." + fmt.Sprintf("%d", cfg.Keys.MeshSubnet[0]) + ".0.0/16"
+	if cfg.CustomSubnet != nil {
+		meshSubnetPrefix = cfg.CustomSubnet.String()
+	}
+
+	// Format PSK as base64
+	pskBase64 := base64.StdEncoding.EncodeToString(cfg.Keys.PSK[:])
+
+	conf := fmt.Sprintf(`[Interface]
+PrivateKey = %s
+Address = %s/32
+DNS = 1.1.1.1
+
+[Peer]
+# wgmesh server / mesh introducer
+PublicKey = %s
+PresharedKey = %s
+Endpoint = %s
+AllowedIPs = %s
+PersistentKeepalive = 25
+`, client.WGPrivateKey, client.MeshIP, serverPubKey, pskBase64, *serverEndpoint, meshSubnetPrefix)
+
+	if *serverEndpoint == "" {
+		conf = strings.ReplaceAll(conf, *serverEndpoint, "UNKNOWN (set manually)")
+	}
+
+	// Add IPv6 comment if available
+	if client.MeshIPv6 != "" {
+		conf = fmt.Sprintf("# Address (IPv6): %s/128\n%s", client.MeshIPv6, conf)
+	}
+
+	fmt.Println("\n" + strings.Repeat("=", 60))
+	fmt.Println("WireGuard Configuration for:", *name)
+	fmt.Println(strings.Repeat("=", 60))
+	fmt.Println(conf)
+
+	// Print QR code
+	if !*noQR {
+		fmt.Println(strings.Repeat("=", 60))
+		fmt.Println("QR Code (scan with WireGuard mobile app):")
+		fmt.Println(strings.Repeat("=", 60))
+		qr, err := qrcode.New(conf, qrcode.Medium)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Warning: Failed to generate QR code: %v\n", err)
+		} else {
+			fmt.Println(qr.ToSmallString(false))
+		}
+	}
+
+	fmt.Println(strings.Repeat("=", 60))
+	fmt.Printf("Client saved to: %s\n", daemon.ClientsFilePath(*iface))
+	fmt.Println("Reload daemon with: systemctl reload-or-restart wgmesh")
+	fmt.Println("or send SIGHUP to the daemon process")
+}
+
+// shortKeyStr returns the first 8 characters of a base64 key
+func shortKeyStr(key string) string {
+	if len(key) > 8 {
+		return key[:8]
+	}
+	return key
 }
 
 // testPeerCmd tests direct peer exchange connectivity
@@ -686,6 +906,9 @@ func installServiceCmd() {
 	noPunching := fs.Bool("no-punching", false, "Disable NAT port punching/rendezvous")
 	introducerMode := fs.Bool("introducer", false, "Allow this node to act as rendezvous introducer")
 	meshSubnet := fs.String("mesh-subnet", "", "Custom mesh subnet CIDR (e.g. 192.168.100.0/24)")
+	var staticPeers staticPeerFlag
+	fs.Var(&staticPeers, "static-peer",
+		"Add a static peer (repeatable). Format: <pubkey>[@<ip:port>[,<meshIP>[,<hostname>[,<cidr>...]]]]")
 	fs.Parse(os.Args[2:])
 
 	if *secret == "" {
@@ -718,6 +941,7 @@ func installServiceCmd() {
 		DisablePunching:     *noPunching,
 		Introducer:          *introducerMode,
 		MeshSubnet:          *meshSubnet,
+		StaticPeers:         []daemon.StaticPeerSpec(staticPeers),
 	}
 
 	fmt.Println("Installing wgmesh systemd service...")

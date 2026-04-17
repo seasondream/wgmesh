@@ -22,6 +22,19 @@ const (
 	DefaultInterfaceDarwin = "utun20"
 )
 
+// StaticPeerSpec describes an operator-configured peer that does not run the
+// wgmesh agent (e.g. OPNsense router, mobile device). All fields except
+// WGPubKey are optional; an empty Endpoint means the peer only accepts
+// inbound WireGuard connections.
+type StaticPeerSpec struct {
+	WGPubKey         string   // required: 32-byte base64 WireGuard public key
+	Endpoint         string   // optional: ip:port of the peer's WireGuard listener
+	MeshIP           string   // optional: mesh IPv4 address (e.g. "10.42.0.5")
+	MeshIPv6         string   // optional: mesh IPv6 address
+	RoutableNetworks []string // optional: LAN CIDRs behind this peer to route
+	Hostname         string   // optional: human-readable label for logs/status
+}
+
 // Config holds all derived configuration for the mesh daemon
 type Config struct {
 	Secret          string
@@ -37,7 +50,8 @@ type Config struct {
 	DisableIPv6     bool
 	ForceRelay      bool
 	DisablePunching bool
-	CustomSubnet    *net.IPNet // User-specified mesh subnet (nil = use derived)
+	CustomSubnet    *net.IPNet      // User-specified mesh subnet (nil = use derived)
+	StaticPeers     []StaticPeerSpec
 }
 
 // DaemonOpts holds options for the daemon
@@ -55,6 +69,7 @@ type DaemonOpts struct {
 	ForceRelay          bool
 	DisablePunching     bool
 	MeshSubnet          string // Custom mesh subnet CIDR (e.g. "192.168.100.0/24")
+	StaticPeers         []StaticPeerSpec
 }
 
 // NewConfig creates a new daemon configuration from options
@@ -117,6 +132,10 @@ func NewConfig(opts DaemonOpts) (*Config, error) {
 		}
 	}
 
+	if err := validateStaticPeers(opts.StaticPeers); err != nil {
+		return nil, fmt.Errorf("invalid static peer configuration: %w", err)
+	}
+
 	return &Config{
 		Secret:          secret,
 		Keys:            keys,
@@ -132,7 +151,33 @@ func NewConfig(opts DaemonOpts) (*Config, error) {
 		ForceRelay:      opts.ForceRelay,
 		DisablePunching: opts.DisablePunching,
 		CustomSubnet:    customSubnet,
+		StaticPeers:     opts.StaticPeers,
 	}, nil
+}
+
+// validateStaticPeers checks each static peer spec for a valid WireGuard
+// public key and, if provided, a valid endpoint and CIDR list.
+func validateStaticPeers(specs []StaticPeerSpec) error {
+	for i, s := range specs {
+		if s.WGPubKey == "" {
+			return fmt.Errorf("static peer [%d]: WGPubKey is required", i)
+		}
+		decoded, err := base64.StdEncoding.DecodeString(s.WGPubKey)
+		if err != nil || len(decoded) != 32 {
+			return fmt.Errorf("static peer [%d] %q: WGPubKey must be a 32-byte base64 WireGuard public key", i, s.WGPubKey)
+		}
+		if s.Endpoint != "" {
+			if _, _, err := net.SplitHostPort(s.Endpoint); err != nil {
+				return fmt.Errorf("static peer [%d] %q: invalid endpoint %q: %w", i, s.WGPubKey, s.Endpoint, err)
+			}
+		}
+		for _, cidr := range s.RoutableNetworks {
+			if _, _, err := net.ParseCIDR(cidr); err != nil {
+				return fmt.Errorf("static peer [%d] %q: invalid routable network %q: %w", i, s.WGPubKey, cidr, err)
+			}
+		}
+	}
+	return nil
 }
 
 // PrefixLen returns the prefix length for the mesh subnet.

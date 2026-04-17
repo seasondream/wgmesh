@@ -23,6 +23,7 @@ type PeerCacheEntry struct {
 	MeshIPv6         string   `json:"mesh_ipv6,omitempty"`
 	Endpoint         string   `json:"endpoint"`
 	Introducer       bool     `json:"introducer,omitempty"`
+	IsStatic         bool     `json:"is_static,omitempty"`
 	RoutableNetworks []string `json:"routable_networks,omitempty"`
 	NATType          string   `json:"nat_type,omitempty"`
 	LastSeen         int64    `json:"last_seen"`
@@ -70,6 +71,7 @@ func SavePeerCache(interfaceName string, peerStore *PeerStore) error {
 			MeshIPv6:         p.MeshIPv6,
 			Endpoint:         p.Endpoint,
 			Introducer:       p.Introducer,
+			IsStatic:         p.IsStatic,
 			RoutableNetworks: p.RoutableNetworks,
 			NATType:          p.NATType,
 			LastSeen:         p.LastSeen.Unix(),
@@ -123,7 +125,11 @@ func RestoreFromCache(interfaceName string, peerStore *PeerStore) int {
 			LastSeen:         lastSeen,
 		}
 
-		peerStore.Update(peer, "cache")
+		if entry.IsStatic {
+			peerStore.AddStaticPeer(peer)
+		} else {
+			peerStore.Update(peer, "cache")
+		}
 		restored++
 	}
 
