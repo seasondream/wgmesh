@@ -4,7 +4,9 @@ import (
 	"encoding/base64"
 	"fmt"
 	"os/exec"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/atvirokodosprendimai/wgmesh/pkg/ifname"
 	"github.com/atvirokodosprendimai/wgmesh/pkg/ssh"
@@ -60,6 +62,14 @@ type WGPeer struct {
 type PeerTransfer struct {
 	RxBytes uint64
 	TxBytes uint64
+}
+
+// WGPeerDump holds peer info parsed from `wg show dump` output.
+type WGPeerDump struct {
+	Endpoint      string
+	LastHandshake time.Time
+	RxBytes       uint64
+	TxBytes       uint64
 }
 
 // ApplyFullConfiguration creates a fresh WireGuard interface on the remote host
@@ -246,6 +256,58 @@ func GetPeerTransfers(iface string) (map[string]PeerTransfer, error) {
 		fmt.Sscanf(parts[1], "%d", &rx)
 		fmt.Sscanf(parts[2], "%d", &tx)
 		result[parts[0]] = PeerTransfer{RxBytes: rx, TxBytes: tx}
+	}
+
+	return result, nil
+}
+
+// GetPeersDump parses full peer state from `wg show <iface> dump`.
+// Format (tab-separated 9 columns): pubkey, psk, endpoint, allowedIPs, lastHandshakeEpoch, rx, tx, keepalive, protocolVersion
+func GetPeersDump(iface string) (map[string]WGPeerDump, error) {
+	cmd := exec.Command(wgPath, "show", iface, "dump")
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("wg show dump failed: %w", err)
+	}
+
+	result := make(map[string]WGPeerDump)
+	for _, line := range strings.Split(string(output), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		parts := strings.Split(line, "\t")
+		if len(parts) < 7 {
+			continue
+		}
+
+		pubkey := parts[0]
+		endpoint := parts[2]
+
+		var handshakeEpoch int64
+		if e, err := strconv.ParseInt(parts[4], 10, 64); err == nil {
+			handshakeEpoch = e
+		}
+
+		var rx, tx uint64
+		if v, err := strconv.ParseUint(parts[5], 10, 64); err == nil {
+			rx = v
+		}
+		if v, err := strconv.ParseUint(parts[6], 10, 64); err == nil {
+			tx = v
+		}
+
+		var lastHandshake time.Time
+		if handshakeEpoch > 0 {
+			lastHandshake = time.Unix(handshakeEpoch, 0)
+		}
+
+		result[pubkey] = WGPeerDump{
+			Endpoint:      endpoint,
+			LastHandshake: lastHandshake,
+			RxBytes:       rx,
+			TxBytes:       tx,
+		}
 	}
 
 	return result, nil

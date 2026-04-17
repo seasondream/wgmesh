@@ -59,13 +59,16 @@ type PeerAnnouncement struct {
 
 // KnownPeer represents a peer that this node knows about (for transitive discovery)
 type KnownPeer struct {
-	WGPubKey   string `json:"wg_pubkey"`
-	Hostname   string `json:"hostname,omitempty"`
-	MeshIP     string `json:"mesh_ip"`
-	MeshIPv6   string `json:"mesh_ipv6,omitempty"`
-	WGEndpoint string `json:"wg_endpoint"`
-	Introducer bool   `json:"introducer,omitempty"`
-	NATType    string `json:"nat_type,omitempty"`
+	WGPubKey         string   `json:"wg_pubkey"`
+	Hostname         string   `json:"hostname,omitempty"`
+	MeshIP           string   `json:"mesh_ip"`
+	MeshIPv6         string   `json:"mesh_ipv6,omitempty"`
+	WGEndpoint       string   `json:"wg_endpoint"`
+	Introducer       bool     `json:"introducer,omitempty"`
+	NATType          string   `json:"nat_type,omitempty"`
+	RoutableNetworks []string `json:"routable_networks,omitempty"` // networks behind this peer
+	IsStaticClient   bool     `json:"is_static_client,omitempty"` // static client (from clients.json or manual config)
+	ForceRelay       bool     `json:"force_relay,omitempty"`       // opt-in relay annotation
 }
 
 // Validate checks all fields of a KnownPeer for correctness.

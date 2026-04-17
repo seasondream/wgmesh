@@ -3,6 +3,7 @@ module github.com/atvirokodosprendimai/wgmesh
 go 1.25.5
 
 require (
+	github.com/AlecAivazis/survey/v2 v2.3.7
 	github.com/anacrolix/dht/v2 v2.23.0
 	github.com/atvirokodosprendimai/lighthouse-go v0.1.0
 	github.com/prometheus/client_golang v1.12.2

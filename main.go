@@ -11,9 +11,11 @@ import (
 	_ "net/http/pprof"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/AlecAivazis/survey/v2"
 	"github.com/atvirokodosprendimai/wgmesh/pkg/crypto"
 	"github.com/atvirokodosprendimai/wgmesh/pkg/daemon"
 	"github.com/atvirokodosprendimai/wgmesh/pkg/mesh"
@@ -481,42 +483,102 @@ func joinCmd() {
 	}
 }
 
-// addClientCmd creates a new static peer device (e.g., mobile phone, OPNsense)
+// addClientCmd creates a new static peer device via interactive wizard
 func addClientCmd() {
 	fs := flag.NewFlagSet("add-client", flag.ExitOnError)
-	secret := fs.String("secret", "", "Mesh secret (required)")
-	name := fs.String("name", "", "Device name (required, e.g., 'myphone', 'opnsense')")
+	secret := fs.String("secret", "", "Mesh secret (optional, read from WGMESH_SECRET env if not provided)")
 	iface := fs.String("interface", "", "WireGuard interface name (default: wg0)")
 	serverEndpoint := fs.String("server-endpoint", "", "Server public endpoint (ip:port, optional)")
-	routableNetworks := fs.String("routable-networks", "", "Comma-separated CIDRs behind this client (optional)")
-	noQR := fs.Bool("no-qr", false, "Skip QR code output")
 	fs.Parse(os.Args[2:])
-
-	if *secret == "" {
-		fmt.Fprintln(os.Stderr, "Error: --secret is required")
-		os.Exit(1)
-	}
-	if *name == "" {
-		fmt.Fprintln(os.Stderr, "Error: --name is required")
-		os.Exit(1)
-	}
 
 	// Set default interface
 	if *iface == "" {
 		*iface = daemon.DefaultInterface
 	}
 
-	// Create config to derive keys and subnet
-	cfg, err := daemon.NewConfig(daemon.DaemonOpts{
-		Secret:        *secret,
-		InterfaceName: *iface,
-	})
+	// If secret not provided, try environment variable
+	if *secret == "" {
+		if envSecret := os.Getenv("WGMESH_SECRET"); envSecret != "" {
+			*secret = envSecret
+		}
+	}
+
+	// Load existing clients
+	cf, err := daemon.LoadClientsFile(*iface)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to create config: %v\n", err)
+		fmt.Fprintf(os.Stderr, "Failed to load clients file: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Load local node state to get server's public key
+	// Generate new keypair first (needed for IP derivation)
+	privKey, pubKey, err := wireguard.GenerateKeyPair()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to generate WireGuard keypair: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Generate random PSK
+	pskStr, err := wireguard.GeneratePSK()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to generate PSK: %v\n", err)
+		os.Exit(1)
+	}
+
+	// Decode PSK for later use
+	pskBytes, _ := base64.StdEncoding.DecodeString(pskStr)
+	if len(pskBytes) != 32 {
+		pskBytes = []byte(pskStr)
+	}
+
+	// Compute default mesh IP
+	defaultMeshIP := daemon.NextClientMeshIP(cf.Clients, "10.43.0.0/16")
+
+	// Launch interactive wizard
+	var answers struct {
+		Name       string
+		MeshIP     string
+		SystemType string
+		Port       int
+	}
+
+	qs := []*survey.Question{
+		{
+			Name:     "Name",
+			Prompt:   &survey.Input{Message: "Client name:", Default: "client1"},
+			Validate: survey.Required,
+		},
+		{
+			Name:     "MeshIP",
+			Prompt:   &survey.Input{Message: "Mesh IP:", Default: defaultMeshIP},
+			Validate: survey.Required,
+		},
+		{
+			Name: "SystemType",
+			Prompt: &survey.Select{
+				Message: "System type:",
+				Options: []string{"OPNsense", "pfSense", "Standalone Linux", "Mobile (QR)"},
+				Default: "Standalone Linux",
+			},
+		},
+		{
+			Name:     "Port",
+			Prompt:   &survey.Input{Message: "WireGuard port:", Default: "51820"},
+			Validate: survey.Required,
+		},
+	}
+
+	if err := survey.Ask(qs, &answers); err != nil {
+		fmt.Fprintf(os.Stderr, "Wizard cancelled\n")
+		os.Exit(1)
+	}
+
+	// Parse port
+	port, _ := strconv.Atoi(answers.Port)
+	if port == 0 {
+		port = 51820
+	}
+
+	// Load server public key
 	stateFile := fmt.Sprintf("/var/lib/wgmesh/%s.json", *iface)
 	var serverPubKey string
 	if data, err := os.ReadFile(stateFile); err == nil {
@@ -529,115 +591,154 @@ func addClientCmd() {
 	}
 	if serverPubKey == "" {
 		fmt.Fprintf(os.Stderr, "Warning: Could not load server public key from %s\n", stateFile)
-		fmt.Fprintf(os.Stderr, "Hint: Ensure the daemon has been initialized with 'wgmesh join'\n")
 	}
 
-	// Load existing clients
-	cf, err := daemon.LoadClientsFile(*iface)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Failed to load clients file: %v\n", err)
+	// If server endpoint not provided via flag, ask for it if empty
+	if *serverEndpoint == "" && serverPubKey != "" {
+		prompt := &survey.Input{
+			Message: "Server public endpoint (ip:port) [optional]:",
+		}
+		survey.AskOne(prompt, serverEndpoint)
+	}
+
+	// Create client entry
+	client := &daemon.ClientEntry{
+		Name:         answers.Name,
+		WGPubKey:     pubKey,
+		WGPrivateKey: privKey,
+		MeshIP:       answers.MeshIP,
+		PSK:          pskStr,
+		CreatedAt:    time.Now().Unix(),
+	}
+
+	// Save to clients file
+	if err := cf.AddOrUpdateClient(*iface, *client); err != nil {
+		fmt.Fprintf(os.Stderr, "Failed to save client: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Check if client already exists
-	var client *daemon.ClientEntry
-	existing := cf.FindClientByName(*name)
-	if existing != nil {
-		client = existing
-		fmt.Printf("[add-client] Client '%s' already exists (reusing keypair)\n", *name)
-	} else {
-		// Generate new keypair
-		privKey, pubKey, err := wireguard.GenerateKeyPair()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to generate WireGuard keypair: %v\n", err)
-			os.Exit(1)
-		}
+	fmt.Printf("\n[add-client] Created client '%s' (pubkey: %s...)\n", answers.Name, shortKeyStr(pubKey))
 
-		// Derive mesh IP
-		meshIP := crypto.DeriveMeshIP(cfg.Keys.MeshSubnet, pubKey, *secret)
-		meshIPv6 := crypto.DeriveMeshIPv6(cfg.Keys.MeshPrefixV6, pubKey, *secret)
+	// Generate system-specific output
+	sep := strings.Repeat("=", 70)
 
-		// Parse routable networks
-		var routables []string
-		if *routableNetworks != "" {
-			for _, cidr := range strings.Split(*routableNetworks, ",") {
-				if r := strings.TrimSpace(cidr); r != "" {
-					routables = append(routables, r)
-				}
-			}
-		}
-
-		client = &daemon.ClientEntry{
-			Name:             *name,
-			WGPubKey:         pubKey,
-			WGPrivateKey:     privKey,
-			MeshIP:           meshIP,
-			MeshIPv6:         meshIPv6,
-			RoutableNetworks: routables,
-		}
-
-		// Save to clients file
-		if err := cf.AddOrUpdateClient(*iface, *client); err != nil {
-			fmt.Fprintf(os.Stderr, "Failed to save client: %v\n", err)
-			os.Exit(1)
-		}
-		fmt.Printf("[add-client] Created new client '%s' (pubkey: %s...)\n", *name, shortKeyStr(pubKey))
+	switch answers.SystemType {
+	case "OPNsense":
+		printOPNsenseConfig(sep, client, serverPubKey, *serverEndpoint)
+	case "pfSense":
+		printPfSenseConfig(sep, client, serverPubKey, *serverEndpoint)
+	case "Mobile (QR)":
+		printMobileConfig(sep, client, serverPubKey, *serverEndpoint, port)
+	default:
+		printLinuxConfig(sep, client, serverPubKey, *serverEndpoint, port)
 	}
 
-	// Generate wg0.conf output
-	meshSubnetPrefix := "10." + fmt.Sprintf("%d", cfg.Keys.MeshSubnet[0]) + ".0.0/16"
-	if cfg.CustomSubnet != nil {
-		meshSubnetPrefix = cfg.CustomSubnet.String()
+	fmt.Println("\n" + sep)
+	fmt.Printf("Client saved to: %s\n", daemon.ClientsFilePath(*iface))
+	fmt.Println("Reload daemon with: systemctl reload-or-restart wgmesh")
+	fmt.Println("or send SIGHUP to the daemon process")
+}
+
+func printOPNsenseConfig(sep string, client *daemon.ClientEntry, serverPubKey, serverEndpoint string) {
+	fmt.Println("\n" + sep)
+	fmt.Println("OPNsense WireGuard Configuration")
+	fmt.Println(sep)
+
+	fmt.Println("\n=== Copy this to the Interface Tab (Wireguard -> Settings -> Instances) ===")
+	fmt.Printf("Public key of this peer: %s\n", client.WGPubKey)
+	fmt.Printf("Tunnel address: %s/32\n", client.MeshIP)
+	fmt.Printf("Listen port: 51820\n")
+
+	fmt.Println("\n=== Copy this to the Peer Tab (Wireguard -> Settings -> Peers) ===")
+	fmt.Printf("Public Key: %s\n", serverPubKey)
+	fmt.Printf("Pre-shared key: %s\n", client.PSK)
+	fmt.Printf("Endpoint: %s\n", serverEndpoint)
+	fmt.Printf("Allowed IPs: 10.43.0.0/16\n")
+	fmt.Printf("Persistent keepalive: 25\n")
+}
+
+func printPfSenseConfig(sep string, client *daemon.ClientEntry, serverPubKey, serverEndpoint string) {
+	fmt.Println("\n" + sep)
+	fmt.Println("pfSense WireGuard Configuration")
+	fmt.Println(sep)
+
+	fmt.Println("\n=== Interface Settings (VPN -> WireGuard -> Interfaces) ===")
+	fmt.Printf("Private Key: %s\n", client.WGPrivateKey)
+	fmt.Printf("Public Key: %s\n", client.WGPubKey)
+	fmt.Printf("Address: %s/32\n", client.MeshIP)
+	fmt.Printf("Port: 51820\n")
+
+	fmt.Println("\n=== Peer Settings (VPN -> WireGuard -> Peers) ===")
+	fmt.Printf("Public Key: %s\n", serverPubKey)
+	fmt.Printf("Pre-shared Key: %s\n", client.PSK)
+	fmt.Printf("Endpoint: %s\n", serverEndpoint)
+	fmt.Printf("Allowed IPs: 10.43.0.0/16\n")
+	fmt.Printf("Persistent Keepalive: 25\n")
+}
+
+func printLinuxConfig(sep string, client *daemon.ClientEntry, serverPubKey, serverEndpoint string, port int) {
+	fmt.Println("\n" + sep)
+	fmt.Println("Linux WireGuard Configuration")
+	fmt.Println(sep)
+
+	conf := fmt.Sprintf(`
+[Interface]
+PrivateKey = %s
+Address = %s/32
+ListenPort = %d
+DNS = 1.1.1.1
+
+[Peer]
+PublicKey = %s
+PresharedKey = %s
+Endpoint = %s
+AllowedIPs = 10.43.0.0/16
+PersistentKeepalive = 25
+`, client.WGPrivateKey, client.MeshIP, port, serverPubKey, client.PSK, serverEndpoint)
+
+	if client.MeshIPv6 != "" {
+		conf = fmt.Sprintf("# IPv6 Address: %s/128\n%s", client.MeshIPv6, conf)
 	}
 
-	// Format PSK as base64
-	pskBase64 := base64.StdEncoding.EncodeToString(cfg.Keys.PSK[:])
+	fmt.Println("\nWireGuard config (save as /etc/wireguard/wg0.conf):")
+	fmt.Println(conf)
+}
+
+func printMobileConfig(sep string, client *daemon.ClientEntry, serverPubKey, serverEndpoint string, port int) {
+	fmt.Println("\n" + sep)
+	fmt.Println("Mobile WireGuard Configuration (Scan QR Code)")
+	fmt.Println(sep)
 
 	conf := fmt.Sprintf(`[Interface]
 PrivateKey = %s
 Address = %s/32
+ListenPort = %d
 DNS = 1.1.1.1
 
 [Peer]
-# wgmesh server / mesh introducer
 PublicKey = %s
 PresharedKey = %s
 Endpoint = %s
-AllowedIPs = %s
+AllowedIPs = 10.43.0.0/16
 PersistentKeepalive = 25
-`, client.WGPrivateKey, client.MeshIP, serverPubKey, pskBase64, *serverEndpoint, meshSubnetPrefix)
+`, client.WGPrivateKey, client.MeshIP, port, serverPubKey, client.PSK, serverEndpoint)
 
-	if *serverEndpoint == "" {
-		conf = strings.ReplaceAll(conf, *serverEndpoint, "UNKNOWN (set manually)")
-	}
-
-	// Add IPv6 comment if available
 	if client.MeshIPv6 != "" {
-		conf = fmt.Sprintf("# Address (IPv6): %s/128\n%s", client.MeshIPv6, conf)
+		conf = fmt.Sprintf("# IPv6 Address: %s/128\n%s", client.MeshIPv6, conf)
 	}
 
-	fmt.Println("\n" + strings.Repeat("=", 60))
-	fmt.Println("WireGuard Configuration for:", *name)
-	fmt.Println(strings.Repeat("=", 60))
+	fmt.Println("\nWireGuard Configuration:")
 	fmt.Println(conf)
 
-	// Print QR code
-	if !*noQR {
-		fmt.Println(strings.Repeat("=", 60))
-		fmt.Println("QR Code (scan with WireGuard mobile app):")
-		fmt.Println(strings.Repeat("=", 60))
-		qr, err := qrcode.New(conf, qrcode.Medium)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "Warning: Failed to generate QR code: %v\n", err)
-		} else {
-			fmt.Println(qr.ToSmallString(false))
-		}
+	fmt.Println(sep)
+	fmt.Println("QR Code (scan with WireGuard mobile app):")
+	fmt.Println(sep)
+	qr, err := qrcode.New(conf, qrcode.Medium)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Warning: Failed to generate QR code: %v\n", err)
+	} else {
+		fmt.Println(qr.ToSmallString(false))
 	}
-
-	fmt.Println(strings.Repeat("=", 60))
-	fmt.Printf("Client saved to: %s\n", daemon.ClientsFilePath(*iface))
-	fmt.Println("Reload daemon with: systemctl reload-or-restart wgmesh")
-	fmt.Println("or send SIGHUP to the daemon process")
 }
 
 // shortKeyStr returns the first 8 characters of a base64 key
@@ -1082,9 +1183,11 @@ func createRPCServer(d *daemon.Daemon, socketPath string) (daemon.RPCServer, err
 					MeshIP:           p.MeshIP,
 					Endpoint:         p.Endpoint,
 					LastSeen:         p.LastSeen,
+					LastHandshake:    p.LastHandshake,
 					DiscoveredVia:    p.DiscoveredVia,
 					RoutableNetworks: p.RoutableNetworks,
 					LatencyMs:        p.LatencyMs,
+					RelayVia:         p.RelayVia,
 				}
 			}
 			return result
@@ -1100,9 +1203,11 @@ func createRPCServer(d *daemon.Daemon, socketPath string) (daemon.RPCServer, err
 				MeshIP:           peer.MeshIP,
 				Endpoint:         peer.Endpoint,
 				LastSeen:         peer.LastSeen,
+				LastHandshake:    peer.LastHandshake,
 				DiscoveredVia:    peer.DiscoveredVia,
 				RoutableNetworks: peer.RoutableNetworks,
 				LatencyMs:        peer.LatencyMs,
+				RelayVia:         peer.RelayVia,
 			}, true
 		},
 		GetPeerCounts: d.GetRPCPeerCounts,
@@ -1194,9 +1299,15 @@ func handlePeersList(client *rpc.Client) {
 		return
 	}
 
-	fmt.Printf("%-20s %-19s %-15s %-25s %-10s %-10s %s\n", "HOSTNAME", "PUBLIC KEY", "MESH IP", "ENDPOINT", "LAST SEEN", "LATENCY", "DISCOVERED VIA")
-	fmt.Println(strings.Repeat("-", 130))
+	// Query kernel for live endpoint and handshake data
+	kernelPeers, _ := wireguard.GetPeersDump(daemon.DefaultInterface)
 
+	// Header with PATH column
+	fmt.Printf("%-20s %-19s %-15s %-25s %-15s %-10s %-10s %-10s %s\n",
+		"HOSTNAME", "PUBLIC KEY", "MESH IP", "ENDPOINT", "LAST HANDSHAKE", "LAST SEEN", "LATENCY", "PATH", "DISCOVERED VIA")
+	fmt.Println(strings.Repeat("-", 170))
+
+	now := time.Now()
 	for _, peerData := range peersData {
 		peer, ok := peerData.(map[string]interface{})
 		if !ok {
@@ -1223,6 +1334,12 @@ func handlePeersList(client *rpc.Client) {
 		meshIP, _ := peer["mesh_ip"].(string)
 		endpoint, _ := peer["endpoint"].(string)
 		lastSeen, _ := peer["last_seen"].(string)
+		relayVia, _ := peer["relay_via"].(string)
+
+		// Use kernel endpoint if available
+		if kernelData, ok := kernelPeers[pubkey]; ok && kernelData.Endpoint != "" {
+			endpoint = kernelData.Endpoint
+		}
 
 		lastSeenTime, err := time.Parse(time.RFC3339, lastSeen)
 		lastSeenStr := "unknown"
@@ -1230,11 +1347,29 @@ func handlePeersList(client *rpc.Client) {
 			lastSeenStr = formatDuration(time.Since(lastSeenTime))
 		}
 
+		// Get last handshake from kernel or RPC
+		var lastHandshakeStr string
+		var lastHandshakeTime time.Time
+		if kernelData, ok := kernelPeers[pubkey]; ok && !kernelData.LastHandshake.IsZero() {
+			lastHandshakeTime = kernelData.LastHandshake
+			lastHandshakeStr = formatDuration(now.Sub(lastHandshakeTime))
+		} else {
+			lastHandshakeStr = "-"
+		}
+
 		latencyStr := "-"
 		if v, ok := peer["latency_ms"]; ok && v != nil {
 			if ms, ok := v.(float64); ok {
 				latencyStr = fmt.Sprintf("%.1fms", ms)
 			}
+		}
+
+		// Determine path type
+		pathStr := "pending"
+		if relayVia != "" {
+			pathStr = "relay"
+		} else if endpoint != "" {
+			pathStr = "direct"
 		}
 
 		var discoveredViaStr []string
@@ -1248,7 +1383,22 @@ func handlePeersList(client *rpc.Client) {
 			}
 		}
 
-		fmt.Printf("%-20s %-19s %-15s %-25s %-10s %-10s %s\n", hostname, pubkeyShort, meshIP, endpoint, lastSeenStr, latencyStr, strings.Join(discoveredViaStr, ","))
+		// Color code based on handshake age
+		handshakeColor := ""
+		resetColor := ""
+		if lastHandshakeTime.After(time.Time{}) && now.Sub(lastHandshakeTime) < 3*time.Minute {
+			handshakeColor = "\033[32m" // green
+			resetColor = "\033[0m"
+		} else if lastHandshakeStr != "-" {
+			handshakeColor = "\033[31m" // red
+			resetColor = "\033[0m"
+		}
+
+		line := fmt.Sprintf("%-20s %-19s %-15s %-25s %s%-15s%s %-10s %-10s %-10s %s",
+			hostname, pubkeyShort, meshIP, endpoint, handshakeColor, lastHandshakeStr, resetColor,
+			lastSeenStr, latencyStr, pathStr, strings.Join(discoveredViaStr, ","))
+
+		fmt.Println(line)
 	}
 }
 

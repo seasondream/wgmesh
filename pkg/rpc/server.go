@@ -20,9 +20,11 @@ type PeerData struct {
 	MeshIP           string
 	Endpoint         string
 	LastSeen         time.Time
+	LastHandshake    time.Time
 	DiscoveredVia    []string
 	RoutableNetworks []string
 	LatencyMs        *float64
+	RelayVia         string
 }
 
 // StatusData represents daemon status for RPC

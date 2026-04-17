@@ -12,6 +12,7 @@ import (
 	"github.com/atvirokodosprendimai/wgmesh/pkg/crypto"
 	"github.com/atvirokodosprendimai/wgmesh/pkg/daemon"
 	"github.com/atvirokodosprendimai/wgmesh/pkg/ratelimit"
+	"github.com/atvirokodosprendimai/wgmesh/pkg/wireguard"
 )
 
 const (
@@ -190,15 +191,40 @@ func (g *MeshGossip) exchangeWithRandomPeer() {
 	for _, p := range peers {
 		if p.WGPubKey != target.WGPubKey {
 			knownPeers = append(knownPeers, crypto.KnownPeer{
-				WGPubKey:   p.WGPubKey,
-				Hostname:   p.Hostname,
-				MeshIP:     p.MeshIP,
-				MeshIPv6:   p.MeshIPv6,
-				WGEndpoint: p.Endpoint,
-				Introducer: p.Introducer,
-				NATType:    p.NATType,
+				WGPubKey:         p.WGPubKey,
+				Hostname:         p.Hostname,
+				MeshIP:           p.MeshIP,
+				MeshIPv6:         p.MeshIPv6,
+				WGEndpoint:       p.Endpoint,
+				Introducer:       p.Introducer,
+				NATType:          p.NATType,
+				RoutableNetworks: p.RoutableNetworks,
 			})
 		}
+	}
+
+	// Append static clients with kernel-resolved endpoints
+	kernelDump, _ := wireguard.GetPeersDump(g.config.InterfaceName)
+	for _, sp := range g.peerStore.GetStaticPeers() {
+		if sp.WGPubKey == target.WGPubKey || sp.WGPubKey == g.localNode.WGPubKey {
+			continue
+		}
+		// Start with configured endpoint as fallback
+		endpoint := sp.Endpoint
+		// Kernel-discovered endpoint takes priority: represents the live NAT-translated path
+		if kd, ok := kernelDump[sp.WGPubKey]; ok && kd.Endpoint != "" {
+			endpoint = kd.Endpoint
+		}
+		knownPeers = append(knownPeers, crypto.KnownPeer{
+			WGPubKey:         sp.WGPubKey,
+			Hostname:         sp.Hostname,
+			MeshIP:           sp.MeshIP,
+			MeshIPv6:         sp.MeshIPv6,
+			WGEndpoint:       endpoint,
+			RoutableNetworks: sp.RoutableNetworks,
+			IsStaticClient:   true,
+			ForceRelay:       sp.Relay,
+		})
 	}
 
 	announcement := crypto.CreateAnnouncement(
@@ -306,13 +332,19 @@ func (g *MeshGossip) handleAnnouncement(announcement *crypto.PeerAnnouncement, s
 			continue
 		}
 		transitivePeer := &daemon.PeerInfo{
-			WGPubKey:   kp.WGPubKey,
-			Hostname:   kp.Hostname,
-			MeshIP:     kp.MeshIP,
-			MeshIPv6:   kp.MeshIPv6,
-			Endpoint:   filterEndpointForConfig(normalizeKnownPeerEndpoint(kp.WGEndpoint), g.config.DisableIPv6),
-			Introducer: kp.Introducer,
-			NATType:    kp.NATType,
+			WGPubKey:         kp.WGPubKey,
+			Hostname:         kp.Hostname,
+			MeshIP:           kp.MeshIP,
+			MeshIPv6:         kp.MeshIPv6,
+			Endpoint:         filterEndpointForConfig(normalizeKnownPeerEndpoint(kp.WGEndpoint), g.config.DisableIPv6),
+			Introducer:       kp.Introducer,
+			NATType:          kp.NATType,
+			RoutableNetworks: kp.RoutableNetworks,
+			Relay:            kp.ForceRelay,
+		}
+		// For ForceRelay peers with no endpoint: mark relay via the announcement sender
+		if kp.ForceRelay && transitivePeer.Endpoint == "" {
+			transitivePeer.RelayVia = announcement.WGPubKey
 		}
 		g.peerStore.Update(transitivePeer, GossipMethod+"-transitive")
 	}

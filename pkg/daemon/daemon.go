@@ -3,6 +3,7 @@ package daemon
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"fmt"
 	"hash/fnv"
 	"log"
@@ -235,6 +236,7 @@ func (d *Daemon) Run() error {
 	}
 
 	d.seedStaticPeers()
+	d.loadManualConfig()
 
 	// Load clients created by `wgmesh add-client`
 	if err := LoadClientsIntoStore(d.config.InterfaceName, d.peerStore); err != nil {
@@ -485,6 +487,49 @@ func (d *Daemon) seedStaticPeers() {
 	}
 }
 
+// loadManualConfig loads and validates peers from the manual config file.
+func (d *Daemon) loadManualConfig() {
+	path := ManualConfigPath(d.config.InterfaceName)
+	peers, errs, err := ParseAndValidateManualConfig(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return // file is optional
+		}
+		log.Printf("[Manual] ERROR reading %s: %v", path, err)
+		return
+	}
+
+	if len(errs) > 0 {
+		for _, e := range errs {
+			log.Printf("[Manual] VALIDATION ERROR peer #%d line %d [%s]: %s", e.Peer, e.Line, e.Field, e.Message)
+		}
+		log.Printf("[Manual] %d error(s) — config NOT applied", len(errs))
+		return
+	}
+
+	for _, mp := range peers {
+		// Decode PSK if present
+		var psk [32]byte
+		if mp.PSK != "" {
+			if decoded, err := base64.StdEncoding.DecodeString(mp.PSK); err == nil && len(decoded) == 32 {
+				copy(psk[:], decoded)
+			}
+		}
+
+		info := &PeerInfo{
+			WGPubKey:         mp.PubKey,
+			RoutableNetworks: mp.AllowedIPs,
+			Endpoint:         mp.Endpoint,
+			PSK:              psk,
+			IsStatic:         true,
+			Relay:            mp.Relay,
+		}
+		d.peerStore.AddStaticPeer(info)
+	}
+
+	log.Printf("Manual configuration loaded and validated from %s (%d peer(s))", path, len(peers))
+}
+
 // reconcile updates WireGuard configuration based on discovered peers
 func (d *Daemon) reconcile() {
 	start := time.Now()
@@ -494,6 +539,15 @@ func (d *Daemon) reconcile() {
 	d.peerStore.RefreshStaticLastSeen()
 
 	peers := d.peerStore.GetActive()
+
+	// Update LastHandshake from WireGuard kernel
+	handshakes, _ := wireguard.GetLatestHandshakes(d.config.InterfaceName)
+	for _, p := range peers {
+		if ts, ok := handshakes[p.WGPubKey]; ok && ts > 0 {
+			p.LastHandshake = time.Unix(ts, 0)
+		}
+	}
+
 	desired, relayRoutes, directStable := d.buildDesiredPeerConfigs(peers)
 	d.relayMu.Lock()
 	d.relayRoutes = relayRoutes
@@ -556,6 +610,25 @@ func (d *Daemon) buildDesiredPeerConfigsWithHandshakes(peers []*PeerInfo, handsh
 		}
 		if d.isTemporarilyOffline(p.WGPubKey) {
 			continue
+		}
+
+		// ForceRelay: honour explicit relay annotation from gossip
+		if p.Relay && p.RelayVia != "" {
+			relay, ok := d.peerStore.Get(p.RelayVia)
+			if ok {
+				relayRoutes[p.WGPubKey] = relay.WGPubKey
+				d.addAllowedIP(desired, relay, p.MeshIP+"/32")
+				if p.MeshIPv6 != "" {
+					d.addAllowedIP(desired, relay, p.MeshIPv6+"/128")
+				}
+				for _, network := range p.RoutableNetworks {
+					network = strings.TrimSpace(network)
+					if network != "" {
+						d.addAllowedIP(desired, relay, network)
+					}
+				}
+				continue
+			}
 		}
 
 		shouldRelay := d.shouldRelayPeerWithSubnets(p, relayCandidates, handshakes, localSubnets)
@@ -765,7 +838,13 @@ func (d *Daemon) applyDesiredPeerConfigs(desired map[string]*desiredPeerConfig) 
 		d.lastAppliedPeerConfigs[pubKey] = signature
 		d.appliedMu.Unlock()
 
-		if err := wireguard.SetPeer(d.config.InterfaceName, pubKey, d.config.Keys.PSK, cfg.peer.Endpoint, allowedCSV); err != nil {
+		// Use per-peer PSK if set, otherwise use global PSK
+		psk := d.config.Keys.PSK
+		if cfg.peer.PSK != [32]byte{} {
+			psk = cfg.peer.PSK
+		}
+
+		if err := wireguard.SetPeer(d.config.InterfaceName, pubKey, psk, cfg.peer.Endpoint, allowedCSV); err != nil {
 			// Rollback the optimistic write on failure
 			d.appliedMu.Lock()
 			delete(d.lastAppliedPeerConfigs, pubKey)
@@ -1315,7 +1394,13 @@ func (d *Daemon) attemptPeerReconnect(peer *PeerInfo) {
 		return
 	}
 
-	if err := wireguard.SetPeer(d.config.InterfaceName, peer.WGPubKey, d.config.Keys.PSK, peer.Endpoint, allowedCSV); err != nil {
+	// Use per-peer PSK if set, otherwise use global PSK
+	psk := d.config.Keys.PSK
+	if peer.PSK != [32]byte{} {
+		psk = peer.PSK
+	}
+
+	if err := wireguard.SetPeer(d.config.InterfaceName, peer.WGPubKey, psk, peer.Endpoint, allowedCSV); err != nil {
 		log.Printf("[Health] Failed to reconnect peer %s...: %v", shortKey(peer.WGPubKey), err)
 		return
 	}
@@ -1488,6 +1573,7 @@ func (d *Daemon) RunWithDHTDiscovery() error {
 	// Seed static peers after cache restore so cache endpoint data is preserved
 	// when the spec only supplies a pubkey; AddStaticPeer promotes the entry.
 	d.seedStaticPeers()
+	d.loadManualConfig()
 
 	// Load clients created by `wgmesh add-client`
 	if err := LoadClientsIntoStore(d.config.InterfaceName, d.peerStore); err != nil {
@@ -1743,8 +1829,10 @@ func (d *Daemon) GetRPCPeers() []*RPCPeerData {
 			MeshIP:           p.MeshIP,
 			Endpoint:         p.Endpoint,
 			LastSeen:         p.LastSeen,
+			LastHandshake:    p.LastHandshake,
 			DiscoveredVia:    p.DiscoveredVia,
 			RoutableNetworks: p.RoutableNetworks,
+			RelayVia:         p.RelayVia,
 		}
 		if p.Latency != nil {
 			ms := float64(p.Latency.Milliseconds())
@@ -1767,8 +1855,10 @@ func (d *Daemon) GetRPCPeer(pubKey string) (*RPCPeerData, bool) {
 		MeshIP:           peer.MeshIP,
 		Endpoint:         peer.Endpoint,
 		LastSeen:         peer.LastSeen,
+		LastHandshake:    peer.LastHandshake,
 		DiscoveredVia:    peer.DiscoveredVia,
 		RoutableNetworks: peer.RoutableNetworks,
+		RelayVia:         peer.RelayVia,
 	}
 	if peer.Latency != nil {
 		ms := float64(peer.Latency.Milliseconds())
@@ -1808,9 +1898,11 @@ type RPCPeerData struct {
 	MeshIP           string
 	Endpoint         string
 	LastSeen         time.Time
+	LastHandshake    time.Time
 	DiscoveredVia    []string
 	RoutableNetworks []string
 	LatencyMs        *float64 // nil when no probe has succeeded yet
+	RelayVia         string   // pubkey of relay peer if using relay routing
 }
 
 // RPCStatusData represents daemon status for RPC (matches rpc.StatusData)

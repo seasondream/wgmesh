@@ -1,11 +1,15 @@
 package daemon
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"time"
 )
 
@@ -17,6 +21,7 @@ type ClientEntry struct {
 	MeshIP           string   `json:"mesh_ip"`
 	MeshIPv6         string   `json:"mesh_ipv6,omitempty"`
 	RoutableNetworks []string `json:"routable_networks,omitempty"`
+	PSK              string   `json:"psk,omitempty"` // base64-encoded preshared key
 	CreatedAt        int64    `json:"created_at"`
 }
 
@@ -71,6 +76,43 @@ func SaveClientsFile(interfaceName string, cf *ClientsFile) error {
 	return os.WriteFile(path, data, 0600)
 }
 
+// NextClientMeshIP finds the next available mesh IP in the given subnet by scanning existing clients.
+// Subnet should be in CIDR notation (e.g., "10.43.0.0/16").
+// Returns an IP like "10.43.0.2" (skipping .0 and .1).
+func NextClientMeshIP(clients []ClientEntry, subnet string) string {
+	_, ipNet, err := net.ParseCIDR(subnet)
+	if err != nil {
+		return subnet // fallback to subnet itself if parsing fails
+	}
+
+	usedIPs := make(map[string]bool)
+	for _, client := range clients {
+		if client.MeshIP != "" {
+			usedIPs[client.MeshIP] = true
+		}
+	}
+
+	// Extract network and start with .2
+	baseIP := ipNet.IP
+	baseStr := baseIP.String()
+	parts := strings.Split(baseStr, ".")
+	if len(parts) != 4 {
+		return subnet
+	}
+
+	netBase := parts[0] + "." + parts[1] + "." + parts[2] + "."
+
+	// Start from .2 and find first unused
+	for i := 2; i <= 254; i++ {
+		candidate := netBase + strconv.Itoa(i)
+		if !usedIPs[candidate] {
+			return candidate
+		}
+	}
+
+	return netBase + "254" // return last possible as fallback
+}
+
 // LoadClientsIntoStore loads all clients from the clients file into the peer
 // store as static peers. Called on daemon startup and on SIGHUP.
 func LoadClientsIntoStore(interfaceName string, peerStore *PeerStore) error {
@@ -80,6 +122,13 @@ func LoadClientsIntoStore(interfaceName string, peerStore *PeerStore) error {
 	}
 
 	for _, client := range cf.Clients {
+		var pskBytes [32]byte
+		if client.PSK != "" {
+			if decoded, err := base64.StdEncoding.DecodeString(client.PSK); err == nil && len(decoded) == 32 {
+				copy(pskBytes[:], decoded)
+			}
+		}
+
 		peer := &PeerInfo{
 			WGPubKey:         client.WGPubKey,
 			Hostname:         client.Name,
@@ -87,6 +136,7 @@ func LoadClientsIntoStore(interfaceName string, peerStore *PeerStore) error {
 			MeshIPv6:         client.MeshIPv6,
 			RoutableNetworks: client.RoutableNetworks,
 			LastSeen:         time.Now(),
+			PSK:              pskBytes,
 		}
 		peerStore.AddStaticPeer(peer)
 	}

@@ -33,3 +33,16 @@ func GenerateKeyPair() (privateKey, publicKey string, err error) {
 
 	return privateKey, publicKey, nil
 }
+
+// GeneratePSK generates a random pre-shared key using the `wg genpsk` command.
+func GeneratePSK() (string, error) {
+	cmd := exec.Command(wgPath, "genpsk")
+	var out bytes.Buffer
+	cmd.Stdout = &out
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("failed to generate PSK: %w", err)
+	}
+
+	return strings.TrimSpace(out.String()), nil
+}

@@ -46,9 +46,13 @@ type PeerInfo struct {
 	IsStatic         bool // operator-configured; never evicted by timeout
 	RoutableNetworks []string
 	LastSeen         time.Time
-	DiscoveredVia    []string       // ["lan", "dht", "gossip"]
-	Latency          *time.Duration // measured via WG handshake
-	NATType          string         // "cone", "symmetric", or "unknown"
+	LastHandshake    time.Time        // last WireGuard handshake from kernel
+	DiscoveredVia    []string         // ["lan", "dht", "gossip"]
+	Latency          *time.Duration   // measured via WG handshake
+	NATType          string           // "cone", "symmetric", or "unknown"
+	PSK              [32]byte         // pre-shared key if set
+	RelayVia         string           // pubkey of relay peer (only set when Relay=true)
+	Relay            bool             // opt-in relay routing via local node
 	endpointMethod   string
 }
 
